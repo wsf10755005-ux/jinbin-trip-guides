@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="theme-color" content="#214b40">
+  <title>更新 LINE 行程回覆</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;background:#f8f5ed;color:#214b40;font:16px/1.8 system-ui,-apple-system,'Microsoft JhengHei',sans-serif}main{max-width:540px;margin:0 auto;padding:36px 22px 45px}h1{font-size:25px;line-height:1.4;margin:8px 0 18px}p{margin:12px 0;color:#5c6d61}.label{font-size:12px;letter-spacing:1px;color:#77816e}.button{display:block;width:100%;padding:16px 12px;margin:14px 0;border:1px solid #214b40;border-radius:5px;background:#214b40;color:#fff;font:inherit;font-size:16px;font-weight:600;line-height:1.5;text-align:center;text-decoration:none;cursor:pointer}.button.secondary{background:#fff;color:#214b40}.button:disabled{opacity:.5;cursor:wait}#status{font-size:14px;min-height:26px;margin:6px 0 14px;color:#425b46}ol{padding-left:23px;font-size:14px;color:#526458}li{padding:7px 0}strong{font-weight:600;color:#214b40}.note{font-size:12px;border-top:1px solid #dce1d5;padding-top:16px;margin-top:25px}details{margin-top:24px;font-size:13px}summary{cursor:pointer}textarea{display:block;width:100%;height:230px;resize:vertical;margin-top:12px;background:#fff;color:#263e31;font:12px/1.6 monospace;border:1px solid #cbd4c5;border-radius:4px;padding:12px}a{color:#214b40}button:focus-visible,a:focus-visible,summary:focus-visible{outline:3px solid #b39765;outline-offset:4px}.help{font-size:12px;margin-top:22px}
+  </style>
+</head>
+<body><main>
+  <div class="label">金賓員工旅遊・管理員操作</div>
+  <h1>更新 LINE 行程回覆</h1>
+  <p>更新後，員工點「行程」時，<br>只會收到自己路線的行程圖片。</p>
+  <button id="copy" class="button" disabled>正在準備程式…</button>
+  <div id="status" role="status" aria-live="polite">請稍候。</div>
+  <a class="button secondary" href="https://dash.cloudflare.com/" target="_blank" rel="noopener noreferrer">② 開啟 Cloudflare</a>
+  <ol>
+    <li>先按上方<strong>「複製更新程式」</strong>。</li>
+    <li>進入 Cloudflare → <strong>Workers & Pages</strong> → <strong>employee-trip-line-bot</strong>。</li>
+    <li>點 <strong>Edit code／編輯程式碼</strong>，全選原程式、貼上，再按 <strong>Deploy／部署</strong>。</li>
+  </ol>
+  <p class="help">手機若看不到編輯畫面，請在瀏覽器選單切換「電腦版網站」。</p>
+  <details id="manual"><summary>無法複製？展開手動選取</summary><textarea id="code" readonly spellcheck="false" aria-label="完整更新程式"></textarea><p>長按文字，選「全選」→「複製」。</p></details>
+  <p class="note">本頁不會自動部署。部署完成後，回 LINE 點「行程」測試。<br><a href="https://developers.cloudflare.com/workers/versions-and-deployments/deployment-management/" target="_blank" rel="noopener noreferrer">Cloudflare 官方操作說明</a></p>
+</main>
+<script>
+  const button=document.getElementById('copy'),status=document.getElementById('status'),textarea=document.getElementById('code'),manual=document.getElementById('manual');
+  let source='';
+  fetch('./worker.txt?v=20261104-image-only',{cache:'no-store'}).then(response=>{if(!response.ok)throw Error();return response.text();}).then(text=>{
+    if(!text.includes('export default')||!text.includes('完整行程圖片')||!text.includes("type: 'image'"))throw Error();
+    source=text;textarea.value=text;button.disabled=false;button.textContent='① 複製更新程式';status.textContent='程式已準備好。';
+  }).catch(()=>{button.textContent='載入失敗';status.textContent='請重新整理後再試一次。';});
+  button.addEventListener('click',async()=>{
+    try{await navigator.clipboard.writeText(source);button.textContent='✓ 已複製更新程式';status.textContent='接著點「開啟 Cloudflare」。';}
+    catch{manual.open=true;textarea.focus();textarea.select();textarea.setSelectionRange(0,source.length);let copied=false;try{copied=document.execCommand('copy');}catch{}status.textContent=copied?'已複製。接著開啟 Cloudflare。':'請長按下方程式，選「全選」→「複製」。';if(copied)button.textContent='✓ 已複製更新程式';}
+  });
+</script>
+</body></html>
