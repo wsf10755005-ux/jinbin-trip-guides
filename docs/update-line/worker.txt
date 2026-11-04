@@ -206,16 +206,21 @@ async function buildReply(message, lineUserId, env, deadline) {
   if (!topic && (!input || input.length > 50 || /[\u0000-\u001f\u007f]/.test(input))) return HELP;
   const result = await appsScript(env, 'portal', topic ? { lineUserId, topic } : { lineUserId, name: input }, deadline);
   if (result.status === 'approved') {
-    if (topic === '行程' && validText(result.reply)) {
-      // Existing Apps Script deployments include this route-specific link in
-      // the first itinerary note. Send its image without the long text reply.
-      const match = result.reply.match(/完整行程圖片[：:][ \t]*(https:\/\/wsf10755005-ux\.github\.io\/jinbin-trip-guides\/assets\/r0[12]-itinerary\.png(?:\?[^\s]+)?)(?=\s|$)/u);
-      if (match) return { type: 'image', originalContentUrl: match[1], previewImageUrl: match[1] };
-      return '行程圖片尚未設定，請聯絡旅遊承辦人。';
+    let imageUrl = topic === '桌次' ? result.imageUrl : undefined;
+    if (topic === '行程') {
+      imageUrl = result.imageUrl;
+      if (imageUrl === undefined) {
+        if (!validText(result.reply)) throw new EmployeeApiError('APPS_REPLY_INVALID', { action: 'trip' });
+        // The Sheet links this note to the route's image URL. This also works
+        // with the existing Apps Script deployment, without changing it.
+        imageUrl = result.reply.match(/完整行程圖片[：:][ \t]*(https?:\/\/\S+)/iu)?.[1];
+      }
+      if (imageUrl === undefined) return '行程圖片尚未設定，請聯絡旅遊承辦人。';
     }
-    if (topic === '桌次' && result.imageUrl !== undefined) {
+    if (imageUrl !== undefined) {
+      if (typeof imageUrl !== 'string') throw new EmployeeApiError('APPS_IMAGE_INVALID');
       let url;
-      try { url = new URL(result.imageUrl); } catch { throw new EmployeeApiError('APPS_IMAGE_INVALID'); }
+      try { url = new URL(imageUrl); } catch { throw new EmployeeApiError('APPS_IMAGE_INVALID'); }
       if (url.protocol !== 'https:' || url.username || url.password || url.toString().length > 2000) {
         throw new EmployeeApiError('APPS_IMAGE_INVALID');
       }
