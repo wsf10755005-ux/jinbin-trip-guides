@@ -18,7 +18,7 @@
   class TripSoundscape {
     constructor(kind) { this.kind = kind; this.enabled = false; this.volume = .15; this.whistleCount = 0; this.nextWhistleAt = Infinity; this.timer = null; }
     init() {
-      if (this.ctx) return;
+      if (this.ctx && this.ctx.state !== 'closed') return;
       const Audio = window.AudioContext || window.webkitAudioContext;
       if (!Audio) throw new Error('unsupported');
       this.ctx = new Audio();
@@ -99,11 +99,13 @@
   quick.addEventListener('click', () => toggle.click());
   document.querySelector('#volume').addEventListener('input', e => sound.setVolume(Number(e.target.value) / 100 * .6));
   document.addEventListener('visibilitychange', async () => {
-    if (!sound.ctx || !sound.enabled) return;
+    if (!sound.ctx || !sound.enabled || sound.ctx.state === 'closed') return;
     if (document.hidden) { await sound.ctx.suspend(); status.textContent = '離開頁面期間暫停聲音'; }
     else { try { await sound.ctx.resume(); renderSound(); } catch { await sound.stop(); renderSound(); } }
   });
+  window.addEventListener('pageshow', renderSound);
   window.addEventListener('pagehide', () => { void sound.dispose(); });
   // Try automatic playback only if browser policy permits it; never pretend it started.
   void sound.start(true).then(renderSound).catch(() => { status.textContent = '點一下開啟聲音，也可以安靜閱讀。'; });
 })();
+
