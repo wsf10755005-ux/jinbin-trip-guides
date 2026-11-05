@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#214b40">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' https://employee-trip-line-bot.wsf10755005.workers.dev; img-src 'self' data:; base-uri 'none'; object-src 'none'; form-action 'none'">
+  <title>集合提醒管理｜金賓員工旅遊</title>
+  <link rel="stylesheet" href="admin.css?v=20261105">
+  <script src="admin.js?v=20261105" defer></script>
+</head>
+<body>
+<header class="topbar"><div><span class="brand">金賓員工旅遊</span><h1>集合提醒管理</h1></div><button id="logout" class="text-button" hidden>登出</button></header>
+<main>
+  <section id="login-panel" class="login-panel">
+    <h2>管理員登入</h2><p>用手機設定集合時間與地點。</p>
+    <form id="login-form">
+      <label for="password">管理密碼</label><div class="password-field"><input id="password" type="password" required autocomplete="current-password" maxlength="512"><button type="button" id="show-password" aria-pressed="false">顯示</button></div>
+      <button id="login-button" class="primary full" type="submit">登入管理頁</button>
+    </form>
+    <p class="fine">登入狀態最多保留 8 小時；密碼不會儲存在這台裝置。</p>
+    <p class="fine"><a href="setup.html">首次使用：電腦設定說明</a></p>
+  </section>
+  <div id="app" hidden>
+    <div class="intro"><p>選路線、時間，貼上地點，確認後即可儲存。</p><span class="zone">台灣時間 UTC+8</span></div>
+    <nav class="tabs" aria-label="管理功能"><button id="tab-new" class="active" type="button" aria-selected="true">新增提醒</button><button id="tab-list" type="button" aria-selected="false">已設定的提醒 <span id="reminder-count"></span></button></nav>
+    <section id="editor">
+      <div class="section-title"><h2 id="editor-title">新增集合提醒</h2><button id="stop-edit" class="text-button" type="button" hidden>取消修改</button></div>
+      <form id="reminder-form">
+        <label for="route">通知哪個方案？</label><select id="route" required><option value="">請選擇路線</option></select><p id="recipient-hint" class="field-hint">依所選路線的有效綁定名單發送。</p>
+        <div class="date-time"><div><label for="date">集合日期</label><input id="date" type="date" required></div><div><label for="time">集合時間</label><input id="time" type="time" required step="60"></div></div>
+        <div id="send-time" class="send-time">提醒會在集合前 10 分鐘自動發送。</div>
+        <label for="place">集合地點</label><input id="place" type="text" maxlength="80" placeholder="例如：金賓汽車頂湖廠" autocomplete="off">
+        <label for="map">Google 地圖連結 <span class="optional">選填</span></label><input id="map" type="url" inputmode="url" placeholder="貼上地圖分享連結" autocomplete="off"><p class="field-hint">地點或地圖連結至少填一項；建議使用地圖「分享」取得的短連結。</p>
+        <p class="notice">集合時間需距現在至少 11 分鐘。已進入發送時段的提醒，無法再修改或取消。</p>
+        <button id="preview-button" class="primary full" type="submit">預覽並確認</button>
+      </form>
+    </section>
+    <section id="listing" hidden>
+      <div class="section-title"><h2>已設定的提醒</h2><button id="refresh" class="text-button" type="button">重新整理</button></div>
+      <div class="filters" aria-label="篩選提醒"><button id="filter-upcoming" class="selected" type="button">即將集合</button><button id="filter-all" type="button">全部紀錄</button></div>
+      <p id="updated-at" class="field-hint"></p><div id="reminder-list"></div>
+    </section>
+  </div>
+  <div id="status" role="status" aria-live="polite" hidden></div>
+  <footer>資料會同步到原本的旅遊資料表。<br>發送狀態為「已發送」，表示 LINE 已接受該筆通知。</footer>
+</main>
+<dialog id="confirmation" aria-labelledby="confirmation-title"><div class="dialog-content"><h2 id="confirmation-title">確認集合提醒</h2><div id="confirmation-body"></div><p id="confirmation-error" class="error-text" role="alert" hidden></p><div class="dialog-actions"><button id="dismiss" class="secondary" type="button">返回修改</button><button id="confirm" class="primary" type="button">確認儲存</button></div></div></dialog>
+</body></html>

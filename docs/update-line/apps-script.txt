@@ -1,0 +1,661 @@
+// LINE signatures and replies stay in the Cloudflare Worker.
+// API_SECRET remains in Apps Script Script Properties, never in source control.
+const TRIP_DATABASE_ID = '1G8WiHGhHtCXHHdpuIJYJ0kt97RmokG831ETA1bTs7ss';
+const TRIP_APPROVED_STATUS = '已核准';
+const TRIP_PENDING_STATUS = '待審核';
+
+function doGet() {
+  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'mobile-admin-20261105' });
+}
+
+function doPost(e) {
+  try {
+    const raw = e && e.postData && e.postData.contents;
+    let body;
+    try { body = JSON.parse(raw || ''); }
+    catch (ignored) { return tripJson_({ success: false, status: 'invalid_request' }); }
+    const secret = PropertiesService.getScriptProperties().getProperty('API_SECRET');
+    if (!secret || !body || typeof body !== 'object' || Array.isArray(body) || body.token !== secret) {
+      return tripJson_({ success: false, status: 'unauthorized' });
+    }
+    const userAction = ['lookup', 'bind', 'trip', 'portal'].includes(body.action);
+    if ((!userAction && !['claimReminders', 'ackReminder', 'adminReminders'].includes(body.action)) ||
+        (userAction && (typeof body.lineUserId !== 'string' || !/^U[0-9a-f]{32}$/.test(body.lineUserId)))) {
+      return tripJson_({ success: false, status: 'invalid_request' });
+    }
+    if ((body.action === 'bind' || (body.action === 'trip' && body.name !== undefined)) &&
+        (typeof body.name !== 'string' || !body.name.trim() || body.name.length > 100 || /[\u0000-\u001f\u007f]/.test(body.name))) {
+      return tripJson_({ success: false, status: 'invalid_request' });
+    }
+    if (body.action === 'ackReminder' &&
+        (!tripSafeKey_(body.reminderId) || !tripSafeKey_(body.batchId) ||
+         typeof body.retryKey !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(body.retryKey))) {
+      return tripJson_({ success: false, status: 'invalid_request' });
+    }
+    const ss = SpreadsheetApp.openById(TRIP_DATABASE_ID);
+    let result;
+    if (body.action === 'portal') result = tripPortal_(ss, body);
+    else if (body.action === 'lookup') result = tripLookup_(ss, body.lineUserId);
+    else if (body.action === 'bind') result = tripBind_(ss, body.lineUserId, body.name.trim());
+    else if (body.action === 'trip') result = tripItinerary_(ss, body.lineUserId, body.name);
+    else if (body.action === 'claimReminders') result = tripClaimReminders_(ss);
+    else if (body.action === 'adminReminders') result = tripAdminReminders_(ss, body);
+    else result = tripAckReminder_(ss, body);
+    return tripJson_(result);
+  } catch (ignored) {
+    // Do not log bodies, names, IDs, employee rows, tokens or exception text.
+    return tripJson_({ success: false, status: 'api_error' });
+  }
+}
+
+function tripJson_(value) {
+  return ContentService.createTextOutput(JSON.stringify(value))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function tripText_(value) {
+  return value == null ? '' : String(value).trim();
+}
+
+function tripTable_(ss, name, expectedHeaders) {
+  const sheet = ss.getSheetByName(name);
+  if (!sheet) throw new Error('Missing table');
+  const range = sheet.getDataRange();
+  const rows = range.getDisplayValues();
+  const headers = rows[0] || [];
+  expectedHeaders.forEach(function (expected, index) {
+    if (expected !== null && tripText_(headers[index]) !== expected) throw new Error('Invalid schema');
+  });
+  // Native date cells may display only M/D on phones. Preserve displayed IDs
+  // and other columns, but read the full stored year for schedule dates.
+  const dateColumn = name === '集合提醒' ? headers.indexOf('集合日期') :
+    name === '每日行程' ? headers.indexOf('日期') : -1;
+  if (dateColumn >= 0) {
+    const values = range.getValues();
+    rows.forEach(function (row, index) {
+      if (!index) return;
+      const value = values[index] && values[index][dateColumn];
+      if (Object.prototype.toString.call(value) === '[object Date]' && Number.isFinite(value.getTime())) {
+        row[dateColumn] = Utilities.formatDate(value, 'Asia/Taipei', 'yyyy-MM-dd');
+      }
+    });
+  }
+  return { sheet: sheet, rows: rows.slice(1), headers: headers };
+}
+
+function tripEmployees_(ss) {
+  return tripTable_(ss, '員工名單', ['員工ID', '姓名', '路線ID', null, '狀態']);
+}
+
+function tripBindings_(ss) {
+  return tripTable_(ss, 'LINE綁定', ['LINE使用者ID', '員工ID', '綁定時間', '狀態']);
+}
+
+function tripStatus_(status) {
+  return { success: true, status: status };
+}
+
+function tripPortal_(ss, body) {
+  const topics = ['行程', '桌次', '房號', '旅遊攻略'];
+  if (body.topic !== undefined && !topics.includes(body.topic)) return tripStatus_('invalid_request');
+  if (body.topic === undefined) {
+    const valid = function (v) { return typeof v === 'string' && v.trim().length > 0 && v.length <= 50 && !/[\u0000-\u001f\u007f]/.test(v); };
+    if (!valid(body.name)) return tripStatus_('name_not_found');
+    const result = tripBind_(ss, body.lineUserId, body.name.trim());
+    if (result.status !== 'approved') return result;
+    return { success: true, status: 'approved', reply: '綁定成功！請點選下方選單查詢行程、桌次、房號或旅遊攻略。' };
+  }
+  const access = tripLookup_(ss, body.lineUserId, true);
+  if (access.status !== 'approved') return access;
+  if (body.topic === '行程') return tripItinerary_(ss, body.lineUserId);
+  let reply;
+  if (body.topic === '房號') reply = '您的房號：' + (tripMessageText_(access.employee.roomNumber, 100) || '尚未安排');
+  if (body.topic === '桌次') {
+    const table = tripTable_(ss, '旅遊路線', ['路線ID', '路線名稱', '交通方式', '開始日期', '結束日期']);
+    const index = table.headers.indexOf('桌次圖片網址');
+    const routes = table.rows.filter(function (row) { return tripText_(row[0]) === access.employee.routeId; });
+    if (routes.length !== 1) return tripStatus_('route_missing');
+    const url = index >= 0 ? tripText_(routes[0][index]) : '';
+    if (url && /^https:\/\/[^\s]+$/i.test(url) && url.length <= 2000) {
+      return { success: true, status: 'approved', imageUrl: url };
+    }
+    reply = '桌次圖片尚未公布。';
+  }
+  if (body.topic === '旅遊攻略') {
+    const rows = tripTable_(ss, '旅遊攻略', ['路線ID', '標題', '內容或連結', '公開狀態']).rows.filter(function (row) {
+      return tripText_(row[0]) === access.employee.routeId && ['', '公開'].includes(tripText_(row[3]));
+    });
+    reply = rows.length ? '旅遊攻略\n' + rows.map(function (row) {
+      return tripMessageText_(row[1], 150) + '\n' + tripText_(row[2]).slice(0, 2000);
+    }).join('\n\n') : '旅遊攻略尚未公布。';
+  }
+  return { success: true, status: 'approved', reply: reply.slice(0, 4500) };
+}
+
+function tripLookup_(ss, lineUserId, includeDetails) {
+  const bindings = tripBindings_(ss).rows;
+  const own = bindings.filter(function (row) { return tripText_(row[0]) === lineUserId; });
+  if (own.length === 0) return tripStatus_('unbound');
+  if (own.length !== 1) return tripStatus_('bind_rejected');
+  const binding = own[0];
+  const status = tripText_(binding[3]);
+  if (status === TRIP_PENDING_STATUS) return tripStatus_('pending');
+  if (status !== TRIP_APPROVED_STATUS) return tripStatus_('disabled');
+  const employeeId = tripText_(binding[1]);
+  if (!employeeId || bindings.some(function (row) {
+    return tripText_(row[1]) === employeeId && tripText_(row[0]) !== lineUserId;
+  })) return tripStatus_('bind_rejected');
+  const employeeTable = tripEmployees_(ss);
+  const matches = employeeTable.rows.filter(function (row) { return tripText_(row[0]) === employeeId; });
+  if (matches.length !== 1) return tripStatus_('bind_rejected');
+  const employee = matches[0];
+  if (tripText_(employee[4]) !== '啟用') return tripStatus_('disabled');
+  const approvedEmployee = { id: employeeId, name: tripText_(employee[1]), routeId: tripText_(employee[2]) };
+  if (includeDetails) {
+    approvedEmployee.roomNumber = tripText_(employeeTable.headers[5]) === '房間號碼' ? tripText_(employee[5]) : '';
+    approvedEmployee.vehicleNumber = tripText_(employeeTable.headers[6]) === '車次' ? tripText_(employee[6]) : '';
+    approvedEmployee.diningSeat = tripText_(employeeTable.headers[7]) === '用餐座位' ? tripText_(employee[7]) : '';
+  }
+  return {
+    success: true,
+    status: 'approved',
+    employee: approvedEmployee
+  };
+}
+
+function tripBind_(ss, lineUserId, name) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(4000)) return tripStatus_('busy');
+  try {
+    // Read BOTH sides under the same lock: checking only before locking races.
+    const employeeTable = tripEmployees_(ss);
+    const employees = employeeTable.rows;
+    const table = tripBindings_(ss);
+    const rows = table.rows;
+    const matches = employees.filter(function (row) { return tripText_(row[1]) === name; });
+    if (matches.length === 0) return tripStatus_('name_not_found');
+    if (matches.length !== 1) return tripStatus_('name_ambiguous');
+    const employee = matches[0];
+    const employeeId = tripText_(employee[0]);
+    if (tripText_(employee[4]) !== '啟用') return tripStatus_('disabled');
+    // Treat IDs as text (including leading zeros); reject formula-like IDs.
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(employeeId) ||
+        employees.filter(function (row) { return tripText_(row[0]) === employeeId; }).length !== 1) {
+      return tripStatus_('bind_rejected');
+    }
+    const ownIndices = [];
+    rows.forEach(function (row, index) {
+      if (tripText_(row[0]) === lineUserId) ownIndices.push(index);
+    });
+    if (ownIndices.length > 1) return tripStatus_('bind_rejected');
+    if (rows.some(function (row) {
+      return tripText_(row[1]) === employeeId && tripText_(row[0]) !== lineUserId;
+    })) return tripStatus_('employee_already_bound');
+    if (ownIndices.length === 1) {
+      const index = ownIndices[0];
+      const existing = rows[index];
+      if (tripText_(existing[1]) !== employeeId) return tripStatus_('bind_rejected');
+      const state = tripText_(existing[3]);
+      if (state === TRIP_APPROVED_STATUS) return tripStatus_('approved');
+      // Never automatically reactivate a revoked/rejected/unknown binding.
+      if (state !== TRIP_PENDING_STATUS) return tripStatus_('disabled');
+      table.sheet.getRange(index + 2, 4).setValue(TRIP_APPROVED_STATUS);
+    } else {
+      table.sheet.appendRow([lineUserId, employeeId, new Date(), TRIP_APPROVED_STATUS]);
+    }
+    SpreadsheetApp.flush();
+    // Personal fields are returned only by approved lookup, not by enrollment.
+    return tripStatus_('approved');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Dates and clock times are interpreted explicitly in Taiwan (UTC+08),
+// independently of the Apps Script project's timezone.
+function tripTaiwanTime_(dateValue, timeValue) {
+  const date = tripText_(dateValue).match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  const time = tripText_(timeValue).match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!date || !time) return null;
+  const year = Number(date[1]), month = Number(date[2]), day = Number(date[3]);
+  const hour = Number(time[1]), minute = Number(time[2]), second = Number(time[3] || 0);
+  if (year < 1900 || month < 1 || month > 12 || day < 1 || day > 31 ||
+      hour > 23 || minute > 59 || second > 59) return null;
+  const local = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  if (local.getUTCFullYear() !== year || local.getUTCMonth() !== month - 1 || local.getUTCDate() !== day) return null;
+  const pad = function (value) { return String(value).padStart(2, '0'); };
+  return {
+    ms: local.getTime() - 8 * 60 * 60 * 1000,
+    date: year + '-' + pad(month) + '-' + pad(day),
+    time: pad(hour) + ':' + pad(minute)
+  };
+}
+
+function tripReminders_(ss) {
+  return tripTable_(ss, '集合提醒', ['提醒ID', '路線ID', '集合日期', '集合時間', '集合地點', '提前分鐘', '發送狀態', '公告ID']);
+}
+
+function tripMessageText_(value, limit) {
+  return tripText_(value).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, limit);
+}
+
+function tripItinerary_(ss, lineUserId, name) {
+  if (name !== undefined) {
+    const enrollment = tripBind_(ss, lineUserId, name.trim());
+    if (enrollment.status !== 'approved') return enrollment;
+  }
+  const access = tripLookup_(ss, lineUserId, true);
+  if (access.status !== 'approved') return access;
+  const routeId = access.employee.routeId;
+  if (!routeId) return tripStatus_('route_missing');
+  const routes = tripTable_(ss, '旅遊路線', ['路線ID', '路線名稱', '交通方式', '開始日期', '結束日期']).rows
+    .filter(function (row) { return tripText_(row[0]) === routeId; });
+  if (routes.length !== 1) return tripStatus_('route_missing');
+  const events = tripTable_(ss, '每日行程', ['行程ID', '路線ID', '日期', '開始時間', '活動名稱', '集合地點', '公開狀態', '備註']).rows
+    .filter(function (row) { return tripText_(row[1]) === routeId && ['', '公開'].includes(tripText_(row[6])); })
+    .map(function (row) { return { row: row, when: tripTaiwanTime_(row[2], row[3]) }; });
+  events.sort(function (a, b) {
+    return (a.when ? a.when.ms : Number.MAX_SAFE_INTEGER) - (b.when ? b.when.ms : Number.MAX_SAFE_INTEGER);
+  });
+  let reply = '您的旅遊行程\n路線：' + (tripMessageText_(routes[0][1], 150) || '路線名稱待填') +
+    '\n房間號碼：' + (tripMessageText_(access.employee.roomNumber, 100) || '尚未安排') +
+    '\n車次：' + (tripMessageText_(access.employee.vehicleNumber, 100) || '尚未安排') +
+    '\n用餐座位：' + (tripMessageText_(access.employee.diningSeat, 100) || '尚未安排');
+  if (!events.length) reply += '\n\n行程尚未填入。';
+  else events.forEach(function (item) {
+    const row = item.row;
+    const when = item.when ? item.when.date + ' ' + item.when.time : '日期／時間待確認';
+    reply += '\n\n' + when + '｜' + (tripMessageText_(row[4], 200) || '活動名稱待填');
+    if (tripText_(row[5])) reply += '\n集合地點：' + tripMessageText_(row[5], 200);
+    if (tripText_(row[7])) reply += '\n備註：' + tripMessageText_(row[7], 300);
+  });
+  const now = Date.now();
+  const next = tripReminders_(ss).rows
+    .filter(function (row) { return tripText_(row[1]) === routeId && !['取消', '停用'].includes(tripText_(row[6])); })
+    .map(function (row) { return { row: row, when: tripTaiwanTime_(row[2], row[3]) }; })
+    .filter(function (item) { return item.when && item.when.ms > now && tripText_(item.row[4]); })
+    .sort(function (a, b) { return a.when.ms - b.when.ms; })[0];
+  if (next) reply += '\n\n下一次集合：' + next.when.date + ' ' + next.when.time +
+    '\n集合地點：' + tripMessageText_(next.row[4], 200);
+  if (reply.length > 4500) reply = reply.slice(0, 4400) + '\n其餘行程請洽旅遊承辦人。';
+  return { success: true, status: 'approved', reply: reply };
+}
+
+const TRIP_REMINDER_PREFIX = 'TRIP_REMINDER_V1_';
+const TRIP_REMINDER_LEASE_MS = 2 * 60 * 1000;
+const TRIP_REMINDER_RETENTION_MS = 24 * 60 * 60 * 1000;
+const TRIP_REMINDER_MAX_BYTES = 300000;
+const TRIP_REMINDER_MAX_PROPERTIES = 120;
+const TRIP_REMINDER_MAX_CLAIM_BATCHES = 12;
+
+function tripSafeKey_(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 200 && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function tripDigest_(value) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, value, Utilities.Charset.UTF_8)
+    .map(function (byte) { return (byte & 255).toString(16).padStart(2, '0'); }).join('').slice(0, 32);
+}
+
+function tripReminderSpec_(row, index) {
+  const when = tripTaiwanTime_(row[2], row[3]);
+  const routeId = tripText_(row[1]), place = tripText_(row[4]), id = tripText_(row[0]);
+  if (!when || !routeId || !place || (id && !tripSafeKey_(id))) return null;
+  const rowNumber = index + 2;
+  const hash = id ? tripDigest_(JSON.stringify([id, routeId, when.ms, place])) : null;
+  return { rowNumber: rowNumber, hash: hash, reminderId: id,
+    routeId: routeId, place: place, when: when, status: tripText_(row[6]) };
+}
+
+function tripReminderParse_(cache, key) {
+  if (!Object.prototype.hasOwnProperty.call(cache, key)) return null;
+  const value = JSON.parse(cache[key]);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid reminder state');
+  return value;
+}
+
+function tripReminderBytes_(value) {
+  return Utilities.newBlob(value, 'application/json').getBytes().length;
+}
+
+function tripReminderStoreFits_(cache, updates) {
+  const merged = Object.assign({}, cache, updates);
+  const keys = Object.keys(merged).filter(function (key) { return key.indexOf(TRIP_REMINDER_PREFIX) === 0; });
+  const workKeys = keys.filter(function (key) { return key.indexOf(TRIP_REMINDER_PREFIX + 'R_') !== 0; });
+  return workKeys.length <= TRIP_REMINDER_MAX_PROPERTIES && keys.every(function (key) {
+    return tripReminderBytes_(merged[key]) <= 8000;
+  }) && keys.reduce(function (total, key) {
+    return total + tripReminderBytes_(key) + tripReminderBytes_(merged[key]);
+  }, 0) <= TRIP_REMINDER_MAX_BYTES;
+}
+
+function tripReminderQueue_(cache, updates, key, value) {
+  const text = JSON.stringify(value);
+  cache[key] = text;
+  updates[key] = text;
+}
+
+function tripReminderCleanup_(store, cache, now, activeIds) {
+  Object.keys(cache).forEach(function (key) {
+    if (key.indexOf(TRIP_REMINDER_PREFIX) !== 0) return;
+    let value;
+    try { value = JSON.parse(cache[key]); } catch (ignored) { return; }
+    const isMarker = key.indexOf(TRIP_REMINDER_PREFIX + 'R_') === 0;
+    const removeMarker = isMarker && (!value || !value.reminderId || !activeIds[value.reminderId]);
+    if (removeMarker || (!isMarker && value && Number.isFinite(value.expiresAt) && value.expiresAt <= now)) {
+      store.deleteProperty(key);
+      delete cache[key];
+    }
+  });
+}
+
+function tripReminderRecipients_(ss) {
+  const employees = tripEmployees_(ss).rows, bindings = tripBindings_(ss).rows;
+  const employeeMap = Object.create(null), employeeCounts = Object.create(null);
+  const lineCounts = Object.create(null), associationCounts = Object.create(null), result = Object.create(null);
+  employees.forEach(function (row) {
+    const id = tripText_(row[0]);
+    employeeCounts[id] = (employeeCounts[id] || 0) + 1;
+    employeeMap[id] = row;
+  });
+  bindings.forEach(function (row) {
+    const line = tripText_(row[0]), id = tripText_(row[1]);
+    lineCounts[line] = (lineCounts[line] || 0) + 1;
+    associationCounts[id] = (associationCounts[id] || 0) + 1;
+  });
+  bindings.forEach(function (row) {
+    const line = tripText_(row[0]), id = tripText_(row[1]), employee = employeeMap[id];
+    if (!/^U[0-9a-f]{32}$/.test(line) || tripText_(row[3]) !== TRIP_APPROVED_STATUS ||
+        lineCounts[line] !== 1 || associationCounts[id] !== 1 || employeeCounts[id] !== 1 ||
+        !employee || tripText_(employee[4]) !== '啟用') return;
+    const route = tripText_(employee[2]);
+    if (!route) return;
+    if (!result[route]) result[route] = [];
+    result[route].push(line);
+  });
+  Object.keys(result).forEach(function (route) { result[route].sort(); });
+  return result;
+}
+
+function tripReminderText_(spec, routeNames) {
+  return '時間快到囉～僅剩十分鐘，集合地點在' + tripMessageText_(spec.place, 200) + '\n路線：' +
+    tripMessageText_(routeNames[spec.routeId] || spec.routeId, 150) +
+    '\n集合時間：' + spec.when.date + ' ' + spec.when.time +
+    '\n集合地點：' + tripMessageText_(spec.place, 200);
+}
+
+function tripReminderComplete_(table, job, cache, updates) {
+  const indices = [];
+  table.rows.forEach(function (row, index) { if (tripText_(row[0]) === job.reminderId) indices.push(index); });
+  const index = indices.length === 1 ? indices[0] : -1;
+  const row = index >= 0 && table.rows[index];
+  const current = row && tripReminderSpec_(row, index);
+  if (current && current.hash === job.hash && tripText_(row[6]) !== '已發送') {
+    table.sheet.getRange(index + 2, 7).setValue('已發送');
+    SpreadsheetApp.flush();
+  }
+  job.complete = true;
+  tripReminderQueue_(cache, updates, TRIP_REMINDER_PREFIX + 'M_' + job.hash, job);
+}
+
+function tripClaimReminders_(ss) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(4000)) return tripStatus_('busy');
+  try {
+    const now = Date.now(), store = PropertiesService.getScriptProperties(), cache = store.getProperties(), updates = {};
+    const table = tripReminders_(ss), batches = [];
+    const idCounts = Object.create(null);
+    table.rows.forEach(function (row) {
+      const id = tripText_(row[0]);
+      if (id) idCounts[id] = (idCounts[id] || 0) + 1;
+    });
+    tripReminderCleanup_(store, cache, now, idCounts);
+    let recipients = null, routeNames = null;
+    for (let index = 0; index < table.rows.length; index++) {
+      if (batches.length >= TRIP_REMINDER_MAX_CLAIM_BATCHES) break;
+      let spec = tripReminderSpec_(table.rows[index], index);
+      if (!spec || ['取消', '停用'].includes(spec.status) || now < spec.when.ms - 10 * 60 * 1000 || now >= spec.when.ms) continue;
+      if (!spec.reminderId) {
+        if (spec.status === '已發送') continue;
+        const id = 'M-' + Utilities.getUuid();
+        if (idCounts[id]) throw new Error('Duplicate generated reminder ID');
+        table.sheet.getRange(index + 2, 1).setValue(id);
+        SpreadsheetApp.flush();
+        table.rows[index][0] = id;
+        idCounts[id] = 1;
+        spec = tripReminderSpec_(table.rows[index], index);
+      }
+      if (idCounts[spec.reminderId] !== 1) continue;
+      const manifestKey = TRIP_REMINDER_PREFIX + 'M_' + spec.hash;
+      const rowKey = TRIP_REMINDER_PREFIX + 'R_' + tripDigest_(spec.reminderId);
+      let job = tripReminderParse_(cache, manifestKey);
+      const marker = tripReminderParse_(cache, rowKey);
+      // Honor explicitly sent rows; editing an already tracked meeting creates
+      // a new generation even when its old sent marker is still visible.
+      if (spec.status === '已發送' && (!marker || marker.hash === spec.hash)) {
+        if (job && !job.complete) { job.complete = true; tripReminderQueue_(cache, updates, manifestKey, job); }
+        continue;
+      }
+      if (job && job.complete) continue;
+      if (!job) {
+        if (!recipients) recipients = tripReminderRecipients_(ss);
+        const to = recipients[spec.routeId] || [];
+        if (!to.length) continue; // New bindings may become eligible next minute.
+        if (!routeNames) {
+          routeNames = Object.create(null);
+          const routeCounts = Object.create(null);
+          tripTable_(ss, '旅遊路線', ['路線ID', '路線名稱', '交通方式', '開始日期', '結束日期']).rows.forEach(function (row) {
+            const id = tripText_(row[0]);
+            if (id) { routeCounts[id] = (routeCounts[id] || 0) + 1; routeNames[id] = tripText_(row[1]); }
+          });
+          Object.keys(routeNames).forEach(function (id) { if (routeCounts[id] !== 1) delete routeNames[id]; });
+        }
+        if (!Object.prototype.hasOwnProperty.call(routeNames, spec.routeId)) continue;
+        const expiresAt = spec.when.ms + TRIP_REMINDER_RETENTION_MS;
+        job = { hash: spec.hash, reminderId: spec.reminderId,
+          meetingMs: spec.when.ms, expiresAt: expiresAt, batchIds: [], complete: false };
+        const fresh = {};
+        for (let offset = 0; offset < to.length; offset += 100) {
+          const batchId = spec.hash + '-' + (offset / 100);
+          job.batchIds.push(batchId);
+          fresh[TRIP_REMINDER_PREFIX + 'B_' + batchId] = JSON.stringify({ reminderId: spec.reminderId,
+            batchId: batchId, retryKey: Utilities.getUuid(), to: to.slice(offset, offset + 100),
+            text: tripReminderText_(spec, routeNames), leaseUntil: 0, acked: false, expiresAt: expiresAt });
+        }
+        fresh[manifestKey] = JSON.stringify(job);
+        fresh[rowKey] = JSON.stringify({ hash: spec.hash, reminderId: spec.reminderId });
+        if (!tripReminderStoreFits_(cache, fresh)) continue;
+        Object.keys(fresh).forEach(function (key) { cache[key] = fresh[key]; updates[key] = fresh[key]; });
+      }
+      let allAcked = true;
+      for (let batchIndex = 0; batchIndex < job.batchIds.length; batchIndex++) {
+        const batchKey = TRIP_REMINDER_PREFIX + 'B_' + job.batchIds[batchIndex];
+        const batch = tripReminderParse_(cache, batchKey);
+        if (!batch) throw new Error('Missing reminder batch');
+        if (batch.acked) continue;
+        allAcked = false;
+        if (batch.leaseUntil > now || batches.length >= TRIP_REMINDER_MAX_CLAIM_BATCHES) continue;
+        batch.leaseUntil = now + TRIP_REMINDER_LEASE_MS;
+        tripReminderQueue_(cache, updates, batchKey, batch);
+        batches.push({ reminderId: batch.reminderId, batchId: batch.batchId, retryKey: batch.retryKey,
+          to: batch.to, text: batch.text });
+      }
+      if (allAcked) tripReminderComplete_(table, job, cache, updates);
+    }
+    if (Object.keys(updates).length) store.setProperties(updates, false);
+    return { success: true, status: 'ok', batches: batches };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function tripAckReminder_(ss, request) {
+  const match = request.batchId.match(/^([0-9a-f]{32})-\d{1,4}$/);
+  if (!match) return tripStatus_('invalid_request');
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(4000)) return tripStatus_('busy');
+  try {
+    const store = PropertiesService.getScriptProperties(), cache = store.getProperties(), updates = {};
+    const manifestKey = TRIP_REMINDER_PREFIX + 'M_' + match[1], batchKey = TRIP_REMINDER_PREFIX + 'B_' + request.batchId;
+    const job = tripReminderParse_(cache, manifestKey), batch = tripReminderParse_(cache, batchKey);
+    if (!job || !batch || job.expiresAt <= Date.now() || job.reminderId !== request.reminderId ||
+        batch.reminderId !== request.reminderId || batch.retryKey !== request.retryKey ||
+        !job.batchIds.includes(request.batchId)) return tripStatus_('invalid_request');
+    if (!batch.acked) {
+      batch.acked = true;
+      batch.leaseUntil = 0;
+      tripReminderQueue_(cache, updates, batchKey, batch);
+    }
+    const allAcked = job.batchIds.every(function (id) {
+      const saved = tripReminderParse_(cache, TRIP_REMINDER_PREFIX + 'B_' + id);
+      return saved && saved.acked;
+    });
+    if (allAcked && !job.complete) tripReminderComplete_(tripReminders_(ss), job, cache, updates);
+    if (Object.keys(updates).length) store.setProperties(updates, false);
+    return tripStatus_('ok');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Only the authenticated Worker admin endpoint calls this API action.
+function tripAdminRevision_(row) {
+  return tripDigest_(JSON.stringify(row.slice(0, 8).map(tripText_)));
+}
+
+function tripAdminRoutes_(ss) {
+  const table = tripTable_(ss, '旅遊路線', ['路線ID', '路線名稱', '交通方式', '開始日期', '結束日期']);
+  const recipients = tripReminderRecipients_(ss), counts = Object.create(null);
+  table.rows.forEach(function (r) { const id = tripText_(r[0]); if (id) counts[id] = (counts[id] || 0) + 1; });
+  return table.rows.filter(function (r) { return tripText_(r[0]) && counts[tripText_(r[0])] === 1; }).map(function (r) {
+    const id = tripText_(r[0]);
+    return { id: id, name: tripText_(r[1]) || id, recipientCount: (recipients[id] || []).length };
+  });
+}
+
+function tripAdminSnapshot_(ss) {
+  const routes = tripAdminRoutes_(ss), names = Object.create(null), now = Date.now();
+  routes.forEach(function (r) { names[r.id] = r.name; });
+  const table = tripReminders_(ss), ids = Object.create(null);
+  table.rows.forEach(function (r) { const id = tripText_(r[0]); if (id) ids[id] = (ids[id] || 0) + 1; });
+  const reminders = [];
+  table.rows.forEach(function (r, index) {
+    if (!r.slice(0, 8).some(function (v) { return tripText_(v) !== ''; })) return;
+    const when = tripTaiwanTime_(r[2], r[3]), id = tripText_(r[0]), state = tripText_(r[6]);
+    const place = tripText_(r[4]), lines = place.split(/\r?\n/), last = lines[lines.length - 1];
+    const map = /^https:\/\/[^\s]+$/i.test(last) ? lines.pop() : '';
+    const editable = Boolean(when && when.ms > now + 10 * 60000 && ['', '待發送'].includes(state) && (!id || ids[id] === 1));
+    reminders.push({ id: id, rowNumber: index + 2, version: tripAdminRevision_(r), routeId: tripText_(r[1]),
+      routeName: names[tripText_(r[1])] || tripText_(r[1]), date: when ? when.date : tripText_(r[2]),
+      time: when ? when.time : tripText_(r[3]), meetingMs: when ? when.ms : null,
+      sendMs: when ? when.ms - 10 * 60000 : null, placeName: lines.join(' '), mapUrl: map,
+      status: state, canEdit: editable, canCancel: editable });
+  });
+  reminders.sort(function (a, b) {
+    const aFuture = a.meetingMs && a.meetingMs > now && !['取消', '停用', '已發送'].includes(a.status);
+    const bFuture = b.meetingMs && b.meetingMs > now && !['取消', '停用', '已發送'].includes(b.status);
+    if (Boolean(aFuture) !== Boolean(bFuture)) return aFuture ? -1 : 1;
+    return aFuture ? a.meetingMs - b.meetingMs : (b.meetingMs || 0) - (a.meetingMs || 0);
+  });
+  return { success: true, status: 'ok', timezone: 'Asia/Taipei', serverNow: now,
+    routes: routes, reminders: reminders.slice(0, 100) };
+}
+
+function tripAdminPayload_(request) {
+  if (!Array.isArray(request.routeIds) || request.routeIds.length < 1 || request.routeIds.length > 2 ||
+      request.routeIds.some(function (id) { return typeof id !== 'string' || !/^[A-Za-z0-9_.-]{1,40}$/.test(id); }) ||
+      new Set(request.routeIds).size !== request.routeIds.length) return { error: 'invalid_route' };
+  if (typeof request.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(request.date) ||
+      typeof request.time !== 'string' || !/^\d{2}:\d{2}$/.test(request.time)) return { error: 'invalid_time' };
+  const when = tripTaiwanTime_(request.date, request.time);
+  if (!when) return { error: 'invalid_time' };
+  if ((request.placeName !== undefined && typeof request.placeName !== 'string') ||
+      (request.mapUrl !== undefined && typeof request.mapUrl !== 'string')) return { error: 'invalid_place' };
+  const name = (request.placeName || '').trim().replace(/\s+/g, ' '), map = (request.mapUrl || '').trim();
+  if (name.length > 80 || /^[=+\-@]/.test(name) || (map && !/^https:\/\/[^\s/@]+(?:[/?#][^\s]*)?$/i.test(map))) {
+    return { error: 'invalid_place' };
+  }
+  const place = [name, map].filter(Boolean).join('\n');
+  if (!place || place.length > 200 || /[\u0000-\u0009\u000b-\u001f\u007f]/.test(place)) return { error: 'invalid_place' };
+  return { when: when, place: place, routes: request.routeIds };
+}
+
+function tripAdminReminders_(ss, request) {
+  const operation = request.operation;
+  if (operation === 'list') return tripAdminSnapshot_(ss);
+  if (!['create', 'update', 'cancel'].includes(operation)) return tripStatus_('invalid_request');
+  let payload;
+  if (operation !== 'cancel') {
+    payload = tripAdminPayload_(request);
+    if (payload.error) return tripStatus_(payload.error);
+  }
+  if (operation === 'create' && (typeof request.submissionId !== 'string' ||
+      !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(request.submissionId))) return tripStatus_('invalid_request');
+  if (operation !== 'create' && (!Number.isInteger(request.rowNumber) || request.rowNumber < 2 ||
+      typeof request.id !== 'string' || (request.id && !tripSafeKey_(request.id)) ||
+      typeof request.version !== 'string' || !/^[0-9a-f]{32}$/.test(request.version))) return tripStatus_('invalid_request');
+  if (operation === 'update' && payload.routes.length !== 1) return tripStatus_('invalid_route');
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(4000)) return tripStatus_('busy');
+  try {
+    const table = tripReminders_(ss), now = Date.now();
+    if (payload) {
+      const routes = tripAdminRoutes_(ss).map(function (r) { return r.id; });
+      if (!payload.routes.every(function (id) { return routes.includes(id); })) return tripStatus_('invalid_route');
+    }
+    if (operation === 'create') {
+      const pending = [], saved = [];
+      for (let i = 0; i < payload.routes.length; i++) {
+        const route = payload.routes[i], id = 'ADMIN-' + request.submissionId + '-' + route;
+        const matches = table.rows.filter(function (r) { return tripText_(r[0]) === id; });
+        if (matches.length > 1) return tripStatus_('conflict');
+        if (matches.length === 1) {
+          const r = matches[0], when = tripTaiwanTime_(r[2], r[3]);
+          if (tripText_(r[1]) !== route || !when || when.ms !== payload.when.ms || tripText_(r[4]) !== payload.place ||
+              ['取消', '停用'].includes(tripText_(r[6]))) return tripStatus_('conflict');
+          saved.push(id); continue;
+        }
+        const duplicate = table.rows.some(function (r) {
+          const when = tripTaiwanTime_(r[2], r[3]);
+          return tripText_(r[1]) === route && when && when.ms === payload.when.ms && !['取消', '停用'].includes(tripText_(r[6]));
+        });
+        if (duplicate) return tripStatus_('duplicate');
+        pending.push([id, route, payload.when.date, payload.when.time, payload.place, '10', '待發送', '']);
+        saved.push(id);
+      }
+      if (!pending.length) return { success: true, status: 'ok', saved: saved };
+      if (payload.when.ms < now + 11 * 60000) return tripStatus_('too_soon');
+      table.sheet.getRange(table.sheet.getLastRow() + 1, 1, pending.length, 8).setValues(pending);
+      SpreadsheetApp.flush();
+      return { success: true, status: 'ok', saved: saved };
+    }
+    let index;
+    if (request.id) {
+      const indices = [];
+      table.rows.forEach(function (r, i) { if (tripText_(r[0]) === request.id) indices.push(i); });
+      if (indices.length !== 1) return tripStatus_(indices.length ? 'conflict' : 'not_found');
+      index = indices[0];
+    } else index = request.rowNumber - 2;
+    const row = table.rows[index];
+    if (!row) return tripStatus_('not_found');
+    if (tripAdminRevision_(row) !== request.version) return tripStatus_('conflict');
+    const state = tripText_(row[6]), when = tripTaiwanTime_(row[2], row[3]);
+    if (!when || when.ms <= now + 10 * 60000 || !['', '待發送'].includes(state)) return tripStatus_('locked');
+    if (operation === 'cancel') {
+      table.sheet.getRange(index + 2, 7).setValue('取消');
+      SpreadsheetApp.flush();
+      return tripStatus_('ok');
+    }
+    if (payload.when.ms < now + 11 * 60000) return tripStatus_('too_soon');
+    if (table.rows.some(function (r, i) {
+      const other = tripTaiwanTime_(r[2], r[3]);
+      return i !== index && tripText_(r[1]) === payload.routes[0] && other && other.ms === payload.when.ms &&
+        !['取消', '停用'].includes(tripText_(r[6]));
+    })) return tripStatus_('duplicate');
+    const updated = [request.id || 'ADMIN-' + Utilities.getUuid(), payload.routes[0], payload.when.date,
+      payload.when.time, payload.place, '10', '待發送', tripText_(row[7])];
+    table.sheet.getRange(index + 2, 1, 1, 8).setValues([updated]);
+    SpreadsheetApp.flush();
+    return tripStatus_('ok');
+  } finally { lock.releaseLock(); }
+}

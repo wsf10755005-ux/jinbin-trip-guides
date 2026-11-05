@@ -23,6 +23,7 @@ class EmployeeApiError extends Error {
 
 export default {
   async fetch(request, env, ctx) {
+    if (new URL(request.url).pathname.startsWith('/admin/')) return handleAdminRequest(request, env);
     const placeholder = TABLE_PLACEHOLDERS[new URL(request.url).pathname];
     if (request.method === 'GET' && placeholder) {
       return new Response(Uint8Array.from(atob(placeholder), c => c.charCodeAt(0)), {
@@ -240,6 +241,151 @@ async function buildReply(message, lineUserId, env, deadline) {
 
 function validText(value) {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= MAX_TEXT_LENGTH;
+}
+
+const ADMIN_ORIGIN = 'https://wsf10755005-ux.github.io';
+const ADMIN_SESSION_MS = 8 * 60 * 60 * 1000;
+const adminLoginAttempts = new Map();
+
+function adminResponse(value, status = 200) {
+  return new Response(status === 204 ? null : JSON.stringify(value), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store',
+      'Access-Control-Allow-Origin': ADMIN_ORIGIN, 'Vary': 'Origin',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'X-Content-Type-Options': 'nosniff'
+    }
+  });
+}
+
+function adminBase64(bytes) {
+  return btoa(String.fromCharCode(...new Uint8Array(bytes))).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+}
+
+function adminDecode(value) {
+  const base = value.replaceAll('-', '+').replaceAll('_', '/');
+  return Uint8Array.from(atob(base + '='.repeat((4 - base.length % 4) % 4)), c => c.charCodeAt(0));
+}
+
+async function adminKey(password) {
+  return crypto.subtle.importKey('raw', new TextEncoder().encode('jinbin.admin.session.v1\0' + password),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+}
+
+async function adminSession(password, now) {
+  const payload = adminBase64(new TextEncoder().encode(JSON.stringify({
+    purpose: 'reminder-admin', issuedAt: now, expiresAt: now + ADMIN_SESSION_MS, nonce: crypto.randomUUID()
+  })));
+  const signature = await crypto.subtle.sign('HMAC', await adminKey(password), new TextEncoder().encode(payload));
+  return payload + '.' + adminBase64(signature);
+}
+
+async function adminAuthorized(request, password, now) {
+  const header = request.headers.get('authorization') || '';
+  if (header.length > 1200 || !/^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(header)) return false;
+  try {
+    const [payload, signature] = header.slice(7).split('.');
+    if (!await crypto.subtle.verify('HMAC', await adminKey(password), adminDecode(signature), new TextEncoder().encode(payload))) return false;
+    const session = JSON.parse(new TextDecoder().decode(adminDecode(payload)));
+    return session.purpose === 'reminder-admin' && Number.isSafeInteger(session.expiresAt) &&
+      Number.isSafeInteger(session.issuedAt) && session.issuedAt <= now + 30000 &&
+      session.expiresAt > now && session.expiresAt - session.issuedAt === ADMIN_SESSION_MS;
+  } catch { return false; }
+}
+
+async function adminPasswordMatches(candidate, expected) {
+  const encode = value => new TextEncoder().encode(value);
+  const [a, b] = await Promise.all([crypto.subtle.digest('SHA-256', encode(candidate)), crypto.subtle.digest('SHA-256', encode(expected))]);
+  const left = new Uint8Array(a), right = new Uint8Array(b);
+  let mismatch = 0;
+  for (let i = 0; i < left.length; i++) mismatch |= left[i] ^ right[i];
+  return mismatch === 0;
+}
+
+async function adminBody(request) {
+  if (!(request.headers.get('content-type') || '').toLowerCase().startsWith('application/json')) throw new Error('invalid');
+  if (Number(request.headers.get('content-length')) > 4096) throw new Error('invalid');
+  if (!request.body) throw new Error('invalid');
+  const reader = request.body.getReader(), chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const part = await reader.read(); if (part.done) break;
+      size += part.value.byteLength;
+      if (size > 4096) { await reader.cancel(); throw new Error('invalid'); }
+      chunks.push(part.value);
+    }
+  } finally { reader.releaseLock(); }
+  const bytes = new Uint8Array(size); let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  const text = new TextDecoder().decode(bytes);
+  const body = JSON.parse(text);
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('invalid');
+  return body;
+}
+
+async function handleAdminRequest(request, env) {
+  const origin = request.headers.get('origin');
+  if (origin && origin !== ADMIN_ORIGIN) return adminResponse({ error: '不允許的來源。' }, 403);
+  if (request.method === 'OPTIONS') return adminResponse(null, 204);
+  const path = new URL(request.url).pathname;
+  if (path === '/admin/health' && request.method === 'GET') {
+    return adminResponse({ service: 'employee-trip', build: 'mobile-admin-20261105',
+      adminConfigured: typeof env.ADMIN_PASSWORD === 'string' && env.ADMIN_PASSWORD.trim().length >= 12 });
+  }
+  if (!['/admin/login', '/admin/reminders'].includes(path)) return adminResponse({ error: '找不到此功能。' }, 404);
+  const password = env.ADMIN_PASSWORD;
+  if (typeof password !== 'string' || password.trim().length < 12) {
+    return adminResponse({ error: '管理功能尚未啟用，請先完成管理密碼設定。', code: 'ADMIN_NOT_CONFIGURED' }, 503);
+  }
+  const now = Date.now();
+  if (path === '/admin/login') {
+    if (request.method !== 'POST') return adminResponse({ error: '不支援此操作。' }, 405);
+    for (const [ip, attempt] of adminLoginAttempts) if (attempt.until <= now) adminLoginAttempts.delete(ip);
+    const ip = (request.headers.get('cf-connecting-ip') || 'unknown').slice(0, 64);
+    const attempt = adminLoginAttempts.get(ip) || { count: 0, until: now + 15 * 60000 };
+    if (attempt.count >= 5) return adminResponse({ error: '登入嘗試次數過多，請稍後再試。' }, 429);
+    if (adminLoginAttempts.size >= 2000) adminLoginAttempts.delete(adminLoginAttempts.keys().next().value);
+    attempt.count++;
+    adminLoginAttempts.set(ip, attempt);
+    let body;
+    try { body = await adminBody(request); } catch { return adminResponse({ error: '輸入格式不正確。' }, 400); }
+    if (typeof body.password !== 'string' || body.password.length > 512 || !await adminPasswordMatches(body.password, password)) {
+      return adminResponse({ error: '管理密碼不正確。' }, 401);
+    }
+    adminLoginAttempts.delete(ip);
+    return adminResponse({ token: await adminSession(password, now), expiresAt: now + ADMIN_SESSION_MS });
+  }
+  if (!await adminAuthorized(request, password, now)) return adminResponse({ error: '請重新登入。' }, 401);
+  if (!['GET', 'POST'].includes(request.method)) return adminResponse({ error: '不支援此操作。' }, 405);
+  let fields = { operation: 'list' };
+  if (request.method === 'POST') {
+    let body;
+    try { body = await adminBody(request); } catch { return adminResponse({ error: '輸入格式不正確。' }, 400); }
+    if (!['create', 'update', 'cancel'].includes(body.operation)) return adminResponse({ error: '不支援此操作。' }, 400);
+    fields = { operation: body.operation };
+    for (const key of ['submissionId', 'id', 'rowNumber', 'version', 'routeIds', 'date', 'time', 'placeName', 'mapUrl']) {
+      if (Object.hasOwn(body, key)) fields[key] = body[key];
+    }
+  }
+  try {
+    const result = await appsScript(env, 'adminReminders', fields, now + 18000);
+    if (result.status === 'ok') return adminResponse(result);
+    const messages = {
+      invalid_request: '輸入資料不完整，請重新檢查。', invalid_time: '日期或時間不正確。',
+      too_soon: '集合時間需距現在至少 11 分鐘。', invalid_place: '請填寫集合地點，或可直接開啟的 HTTPS 地圖連結；地點加網址最多 200 字。',
+      invalid_route: '找不到選擇的路線，請重新整理。', conflict: '這筆資料已變更，請重新整理後再試。',
+      duplicate: '這個路線與時間已有提醒，請修改原本那一筆。', locked: '這筆已取消、已發送或已進入發送時段，無法再修改。',
+      not_found: '找不到這筆提醒。', busy: '目前正在更新提醒，請稍後再試。'
+    };
+    return adminResponse({ error: messages[result.status] || '暫時無法處理，請稍後再試。', code: result.status },
+      ['conflict', 'duplicate', 'locked'].includes(result.status) ? 409 : result.status === 'busy' ? 503 : 400);
+  } catch (error) {
+    logApiError('Admin reminder request failed', error);
+    return adminResponse({ error: '管理頁尚未連接完成，請確認後台程式已更新。', code: 'ADMIN_BACKEND_UNAVAILABLE' }, 502);
+  }
 }
 
 function validReminderBatch(batch) {
