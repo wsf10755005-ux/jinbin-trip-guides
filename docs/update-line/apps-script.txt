@@ -5,7 +5,7 @@ const TRIP_APPROVED_STATUS = '已核准';
 const TRIP_PENDING_STATUS = '待審核';
 
 function doGet() {
-  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'mobile-admin-20261105' });
+  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'room-import-20261105' });
 }
 
 function doPost(e) {
@@ -18,7 +18,7 @@ function doPost(e) {
     if (!secret || !body || typeof body !== 'object' || Array.isArray(body) || body.token !== secret) {
       return tripJson_({ success: false, status: 'unauthorized' });
     }
-    const userAction = ['lookup', 'bind', 'trip', 'portal'].includes(body.action);
+    const userAction = ['lookup', 'bind', 'trip', 'portal', 'roomAdmin'].includes(body.action);
     if ((!userAction && !['claimReminders', 'ackReminder', 'adminReminders'].includes(body.action)) ||
         (userAction && (typeof body.lineUserId !== 'string' || !/^U[0-9a-f]{32}$/.test(body.lineUserId)))) {
       return tripJson_({ success: false, status: 'invalid_request' });
@@ -40,6 +40,7 @@ function doPost(e) {
     else if (body.action === 'trip') result = tripItinerary_(ss, body.lineUserId, body.name);
     else if (body.action === 'claimReminders') result = tripClaimReminders_(ss);
     else if (body.action === 'adminReminders') result = tripAdminReminders_(ss, body);
+    else if (body.action === 'roomAdmin') result = tripRoomAdmin_(ss, body);
     else result = tripAckReminder_(ss, body);
     return tripJson_(result);
   } catch (ignored) {
@@ -659,3 +660,537 @@ function tripAdminReminders_(ss, request) {
     return tripStatus_('ok');
   } finally { lock.releaseLock(); }
 }
+
+// Room assignments can be entered by a designated, already-bound LINE user.
+// Uploaded workbooks are parsed in memory and never stored in Drive.
+const TRIP_ROOM_IMPORT_PREFIX = 'TRIP_ROOM_IMPORT_V1_';
+const TRIP_ROOM_IMPORT_TTL_SECONDS = 10 * 60;
+const TRIP_ROOM_IMPORT_MAX_FILE_BYTES = 3 * 1024 * 1024;
+const TRIP_ROOM_IMPORT_MAX_UNZIPPED_BYTES = 12 * 1024 * 1024;
+const TRIP_ROOM_IMPORT_MAX_CACHE_BYTES = 90000;
+const TRIP_ROOM_IMPORT_MAX_ENTRIES = 200;
+const TRIP_ROOM_IMPORT_MAX_SHEETS = 10;
+const TRIP_ROOM_IMPORT_MAX_ROWS = 2000;
+const TRIP_ROOM_IMPORT_MAX_COLUMNS = 50;
+const TRIP_ROOM_IMPORT_MAX_CELLS = 20000;
+const TRIP_ROOM_IMPORT_MAX_ASSIGNMENTS = 1000;
+
+function tripRoomNormalizeName_(value) {
+  const text = tripText_(value);
+  return text ? text.normalize('NFKC').replace(/\s+/g, '') : '';
+}
+
+function tripRoomNormalizeId_(value) {
+  const text = tripText_(value);
+  return text ? text.normalize('NFKC') : '';
+}
+
+function tripRoomValue_(value) {
+  const text = tripText_(value).normalize('NFKC').replace(/\s+/g, ' ');
+  if (!text || text.length > 40 || /^[=+\-@]/.test(text) || /[\u0000-\u001f\u007f]/.test(text)) return '';
+  return text;
+}
+
+function tripRoomAdminAccess_(ss, lineUserId) {
+  const access = tripLookup_(ss, lineUserId);
+  if (access.status !== 'approved' || !access.employee || !access.employee.id) return null;
+  const table = tripEmployees_(ss);
+  if (tripText_(table.headers[9]) !== '管理權限') return null;
+  const rows = [];
+  table.rows.forEach(function (row, index) {
+    if (tripText_(row[0]) === access.employee.id) rows.push({ row: row, rowNumber: index + 2 });
+  });
+  if (rows.length !== 1 || tripText_(rows[0].row[9]) !== '管理員') return null;
+  return { employeeId: access.employee.id, ownerHash: tripDigest_(lineUserId), rowNumber: rows[0].rowNumber };
+}
+
+function tripRoomImportKey_(importId) {
+  return TRIP_ROOM_IMPORT_PREFIX + importId;
+}
+
+function tripRoomImportId_(value) {
+  return typeof value === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value);
+}
+
+function tripRoomCacheRead_(importId, ownerHash) {
+  if (!tripRoomImportId_(importId)) return null;
+  const text = CacheService.getScriptCache().get(tripRoomImportKey_(importId));
+  if (!text) return null;
+  let saved;
+  try { saved = JSON.parse(text); } catch (ignored) { return null; }
+  if (!saved || saved.version !== 1 || saved.ownerHash !== ownerHash || !Array.isArray(saved.assignments) ||
+      !Number.isFinite(saved.expiresAt) || saved.expiresAt <= Date.now()) return null;
+  return saved;
+}
+
+function tripRoomCacheSave_(ownerHash, assignments) {
+  const importId = Utilities.getUuid();
+  const saved = { version: 1, ownerHash: ownerHash, expiresAt: Date.now() + TRIP_ROOM_IMPORT_TTL_SECONDS * 1000,
+    assignments: assignments };
+  const text = JSON.stringify(saved);
+  if (Utilities.newBlob(text, 'application/json').getBytes().length > TRIP_ROOM_IMPORT_MAX_CACHE_BYTES) return null;
+  CacheService.getScriptCache().put(tripRoomImportKey_(importId), text, TRIP_ROOM_IMPORT_TTL_SECONDS);
+  return importId;
+}
+
+function tripRoomXmlDecode_(value) {
+  return String(value || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(
+    /&(?:#(\d+)|#x([0-9a-f]+)|amp|lt|gt|quot|apos);/gi,
+    function (entity, decimal, hex) {
+      if (decimal) return String.fromCodePoint(Number(decimal));
+      if (hex) return String.fromCodePoint(parseInt(hex, 16));
+      return { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'" }[entity.toLowerCase()] || entity;
+    });
+}
+
+function tripRoomXmlRuns_(xml) {
+  const values = [], expression = /<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/gi;
+  let match;
+  while ((match = expression.exec(xml)) !== null) values.push(tripRoomXmlDecode_(match[1].replace(/<[^>]*>/g, '')));
+  return values.join('');
+}
+
+function tripRoomColumnIndex_(reference) {
+  const match = String(reference || '').replace(/\$/g, '').match(/^([A-Z]{1,3})\d+$/i);
+  if (!match) return -1;
+  let value = 0;
+  for (let i = 0; i < match[1].length; i++) value = value * 26 + match[1].toUpperCase().charCodeAt(i) - 64;
+  return value - 1;
+}
+
+function tripRoomCellPoint_(reference) {
+  const match = String(reference || '').replace(/\$/g, '').match(/^([A-Z]{1,3})(\d+)$/i);
+  if (!match) return null;
+  const column = tripRoomColumnIndex_(match[1] + match[2]), row = Number(match[2]) - 1;
+  if (column < 0 || column >= TRIP_ROOM_IMPORT_MAX_COLUMNS || row < 0 || row >= TRIP_ROOM_IMPORT_MAX_ROWS) return null;
+  return { row: row, column: column };
+}
+
+function tripRoomSharedStrings_(xml) {
+  if (!xml) return [];
+  const strings = [], expression = /<si(?:\s[^>]*)?>([\s\S]*?)<\/si>/gi;
+  let match;
+  while ((match = expression.exec(xml)) !== null) {
+    if (strings.length >= TRIP_ROOM_IMPORT_MAX_CELLS) throw new Error('Workbook too large');
+    strings.push(tripRoomXmlRuns_(match[1]).slice(0, 500));
+  }
+  return strings;
+}
+
+function tripRoomWorksheetRows_(xml, sharedStrings) {
+  const rows = [], rowExpression = /<row\b([^>]*)>([\s\S]*?)<\/row>/gi;
+  let rowMatch, populated = 0;
+  while ((rowMatch = rowExpression.exec(xml)) !== null) {
+    const rowAttribute = rowMatch[1].match(/\br="(\d+)"/i);
+    const rowIndex = rowAttribute ? Number(rowAttribute[1]) - 1 : rows.length;
+    if (!Number.isInteger(rowIndex) || rowIndex < 0 || rowIndex >= TRIP_ROOM_IMPORT_MAX_ROWS) throw new Error('Workbook too large');
+    if (!rows[rowIndex]) rows[rowIndex] = [];
+    const cellExpression = /<c\b([^>]*)>([\s\S]*?)<\/c>/gi;
+    let cellMatch;
+    while ((cellMatch = cellExpression.exec(rowMatch[2])) !== null) {
+      const reference = cellMatch[1].match(/\br="([^"]+)"/i);
+      if (!reference) continue;
+      const column = tripRoomColumnIndex_(reference[1]);
+      if (column < 0 || column >= TRIP_ROOM_IMPORT_MAX_COLUMNS) continue;
+      if (++populated > TRIP_ROOM_IMPORT_MAX_CELLS) throw new Error('Workbook too large');
+      const type = (cellMatch[1].match(/\bt="([^"]+)"/i) || [])[1] || '';
+      const raw = (cellMatch[2].match(/<v(?:\s[^>]*)?>([\s\S]*?)<\/v>/i) || [])[1];
+      let value = '';
+      if (type === 'inlineStr') value = tripRoomXmlRuns_(cellMatch[2]);
+      else if (type === 's') {
+        const index = Number(tripRoomXmlDecode_(raw));
+        value = Number.isInteger(index) && index >= 0 && index < sharedStrings.length ? sharedStrings[index] : '';
+      } else if (raw !== undefined) value = tripRoomXmlDecode_(raw.replace(/<[^>]*>/g, ''));
+      rows[rowIndex][column] = String(value || '').slice(0, 500);
+    }
+  }
+  const mergeExpression = /<mergeCell\b[^>]*\bref="([^"]+)"[^>]*\/?\s*>/gi;
+  let merge, mergeCount = 0;
+  while ((merge = mergeExpression.exec(xml)) !== null) {
+    if (++mergeCount > 1000) throw new Error('Workbook too large');
+    const parts = merge[1].split(':'), start = tripRoomCellPoint_(parts[0]), end = tripRoomCellPoint_(parts[1] || parts[0]);
+    if (!start || !end || end.row < start.row || end.column < start.column ||
+        (end.row - start.row + 1) * (end.column - start.column + 1) > 10000) throw new Error('Workbook too large');
+    const value = rows[start.row] && rows[start.row][start.column];
+    if (value === undefined || value === '') continue;
+    for (let row = start.row; row <= end.row; row++) {
+      if (!rows[row]) rows[row] = [];
+      for (let column = start.column; column <= end.column; column++) {
+        if (rows[row][column] === undefined || rows[row][column] === '') rows[row][column] = value;
+      }
+    }
+  }
+  return rows.map(function (row) { return row || []; });
+}
+
+function tripRoomCsvRows_(text) {
+  text = String(text || '').replace(/^\ufeff/, '');
+  if (!text || text.length > TRIP_ROOM_IMPORT_MAX_UNZIPPED_BYTES || /\u0000/.test(text)) throw new Error('Invalid CSV');
+  let comma = 0, tab = 0, semicolon = 0, quoted = false;
+  for (let i = 0; i < Math.min(text.length, 2000); i++) {
+    const character = text[i];
+    if (character === '"') quoted = !quoted;
+    else if (!quoted && (character === '\r' || character === '\n')) break;
+    else if (!quoted && character === ',') comma++;
+    else if (!quoted && character === '\t') tab++;
+    else if (!quoted && character === ';') semicolon++;
+  }
+  const delimiter = tab > comma && tab >= semicolon ? '\t' : semicolon > comma ? ';' : ',';
+  const rows = [], row = [];
+  let field = '', inQuotes = false, cells = 0;
+  function pushField() {
+    if (row.length < TRIP_ROOM_IMPORT_MAX_COLUMNS) row.push(field.slice(0, 500));
+    field = '';
+    if (++cells > TRIP_ROOM_IMPORT_MAX_CELLS) throw new Error('CSV too large');
+  }
+  function pushRow() {
+    pushField();
+    rows.push(row.splice(0));
+    if (rows.length > TRIP_ROOM_IMPORT_MAX_ROWS) throw new Error('CSV too large');
+  }
+  for (let index = 0; index < text.length; index++) {
+    const character = text[index];
+    if (inQuotes) {
+      if (character === '"' && text[index + 1] === '"') { field += '"'; index++; }
+      else if (character === '"') inQuotes = false;
+      else field += character;
+    } else if (character === '"' && !field) inQuotes = true;
+    else if (character === delimiter) pushField();
+    else if (character === '\n') pushRow();
+    else if (character !== '\r') field += character;
+  }
+  if (inQuotes) throw new Error('Invalid CSV');
+  if (field || row.length) pushRow();
+  return rows;
+}
+
+function tripRoomZipUInt16_(bytes, offset) {
+  if (offset < 0 || offset + 2 > bytes.length) return null;
+  return (bytes[offset] & 255) | ((bytes[offset + 1] & 255) << 8);
+}
+
+function tripRoomZipUInt32_(bytes, offset) {
+  if (offset < 0 || offset + 4 > bytes.length) return null;
+  return ((bytes[offset] & 255) | ((bytes[offset + 1] & 255) << 8) |
+    ((bytes[offset + 2] & 255) << 16) | ((bytes[offset + 3] & 255) * 0x1000000)) >>> 0;
+}
+
+// Inspect the central directory before Utilities.unzip allocates the
+// uncompressed workbook. ZIP64 and encrypted archives are unsupported.
+function tripRoomZipSummary_(bytes) {
+  let end = -1;
+  for (let index = bytes.length - 22; index >= Math.max(0, bytes.length - 65557); index--) {
+    if (tripRoomZipUInt32_(bytes, index) === 0x06054b50) { end = index; break; }
+  }
+  if (end < 0) return { error: 'encrypted_or_invalid_file' };
+  const entries = tripRoomZipUInt16_(bytes, end + 10), centralSize = tripRoomZipUInt32_(bytes, end + 12);
+  const centralOffset = tripRoomZipUInt32_(bytes, end + 16), commentLength = tripRoomZipUInt16_(bytes, end + 20);
+  if (entries === null || centralSize === null || centralOffset === null || commentLength === null ||
+      entries === 0xffff || centralSize === 0xffffffff || centralOffset === 0xffffffff ||
+      entries < 1 || entries > TRIP_ROOM_IMPORT_MAX_ENTRIES || end + 22 + commentLength !== bytes.length ||
+      centralOffset + centralSize > end) return { error: 'encrypted_or_invalid_file' };
+  let offset = centralOffset, uncompressed = 0;
+  for (let index = 0; index < entries; index++) {
+    if (tripRoomZipUInt32_(bytes, offset) !== 0x02014b50) return { error: 'encrypted_or_invalid_file' };
+    const flags = tripRoomZipUInt16_(bytes, offset + 8), size = tripRoomZipUInt32_(bytes, offset + 24);
+    const nameLength = tripRoomZipUInt16_(bytes, offset + 28), extraLength = tripRoomZipUInt16_(bytes, offset + 30);
+    const entryComment = tripRoomZipUInt16_(bytes, offset + 32);
+    if ([flags, size, nameLength, extraLength, entryComment].some(function (value) { return value === null; }) ||
+        (flags & 1) || size === 0xffffffff) return { error: 'encrypted_or_invalid_file' };
+    uncompressed += size;
+    if (uncompressed > TRIP_ROOM_IMPORT_MAX_UNZIPPED_BYTES) return { error: 'file_too_large' };
+    offset += 46 + nameLength + extraLength + entryComment;
+    if (offset > end) return { error: 'encrypted_or_invalid_file' };
+  }
+  if (offset !== centralOffset + centralSize) return { error: 'encrypted_or_invalid_file' };
+  return { entries: entries, uncompressedBytes: uncompressed };
+}
+
+function tripRoomWorkbookTables_(filename, bytes) {
+  const lower = filename.toLowerCase();
+  if (/\.xls$/.test(lower)) return { error: 'unsupported_format' };
+  if (!/\.(xlsx|csv)$/.test(lower)) return { error: 'unsupported_format' };
+  if (!bytes.length || bytes.length > TRIP_ROOM_IMPORT_MAX_FILE_BYTES) return { error: 'file_too_large' };
+  if (/\.csv$/.test(lower)) {
+    const csv = Utilities.newBlob(bytes, 'text/csv', filename).getDataAsString('UTF-8');
+    return { tables: [tripRoomCsvRows_(csv)] };
+  }
+  const zip = tripRoomZipSummary_(bytes);
+  if (zip.error) return zip;
+  let blobs;
+  try { blobs = Utilities.unzip(Utilities.newBlob(bytes,
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', filename)); }
+  catch (ignored) { return { error: 'encrypted_or_invalid_file' }; }
+  if (!Array.isArray(blobs) || !blobs.length || blobs.length > TRIP_ROOM_IMPORT_MAX_ENTRIES) {
+    return { error: 'encrypted_or_invalid_file' };
+  }
+  const entries = Object.create(null);
+  let totalBytes = 0;
+  for (let i = 0; i < blobs.length; i++) {
+    const name = String(blobs[i].getName() || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    const entryBytes = blobs[i].getBytes();
+    totalBytes += entryBytes.length;
+    if (totalBytes > TRIP_ROOM_IMPORT_MAX_UNZIPPED_BYTES) return { error: 'file_too_large' };
+    if (/^(EncryptionInfo|EncryptedPackage)$/i.test(name)) return { error: 'encrypted_or_invalid_file' };
+    if (/^(xl\/sharedStrings\.xml|xl\/worksheets\/[^/]+\.xml)$/i.test(name)) {
+      entries[name.toLowerCase()] = blobs[i].getDataAsString('UTF-8');
+    }
+  }
+  const shared = tripRoomSharedStrings_(entries['xl/sharedstrings.xml'] || '');
+  const sheetNames = Object.keys(entries).filter(function (name) {
+    return /^xl\/worksheets\/[^/]+\.xml$/i.test(name);
+  }).sort().slice(0, TRIP_ROOM_IMPORT_MAX_SHEETS);
+  if (!sheetNames.length) return { error: 'encrypted_or_invalid_file' };
+  return { tables: sheetNames.map(function (name) { return tripRoomWorksheetRows_(entries[name], shared); }) };
+}
+
+function tripRoomHeaderKey_(value) {
+  return tripText_(value).normalize('NFKC').toLowerCase().replace(/[\s_\-.:：／\/()（）#]/g, '');
+}
+
+function tripRoomHeaderType_(value) {
+  const key = tripRoomHeaderKey_(value);
+  if (['員工id', '員工編號', '員編', '工號', 'employeeid', 'staffid'].includes(key)) return 'id';
+  if (['房號', '房間號碼', '客房號碼', 'room', 'roomno', 'roomnumber'].includes(key)) return 'room';
+  if (['姓名', '員工姓名', '中文姓名', 'name', 'guestname'].includes(key) ||
+      /^(旅客姓名|房客姓名|入住人|同住人|旅客|房客)\d*$/.test(key)) return 'name';
+  return '';
+}
+
+function tripRoomSplitNames_(value) {
+  const text = tripText_(value).normalize('NFKC');
+  if (!text) return [];
+  let parts = text.split(/[\r\n、,，;；/]+/).map(tripText_).filter(Boolean);
+  if (parts.length === 1 && /\s/.test(parts[0])) {
+    const spaces = parts[0].split(/\s+/).map(tripText_).filter(Boolean);
+    if (spaces.length > 1 && spaces.every(function (part) { return part.length >= 2 && part.length <= 30; })) parts = spaces;
+  }
+  return parts.filter(function (part) { return part.length <= 50; });
+}
+
+function tripRoomCandidatesFromTables_(tables) {
+  const result = [], issues = [];
+  let headerFound = false;
+  tables.forEach(function (rows, tableIndex) {
+    let best = null;
+    for (let rowIndex = 0; rowIndex < Math.min(rows.length, 30); rowIndex++) {
+      const names = [], ids = [], rooms = [];
+      (rows[rowIndex] || []).slice(0, TRIP_ROOM_IMPORT_MAX_COLUMNS).forEach(function (cell, column) {
+        const type = tripRoomHeaderType_(cell);
+        if (type === 'name') names.push(column);
+        if (type === 'id') ids.push(column);
+        if (type === 'room') rooms.push(column);
+      });
+      if (rooms.length && (names.length || ids.length)) {
+        const score = names.length * 3 + ids.length * 2 - rowIndex / 100;
+        if (!best || score > best.score) best = { rowIndex: rowIndex, names: names, ids: ids, room: rooms[0], score: score };
+      }
+    }
+    if (!best) return;
+    headerFound = true;
+    let carriedRoom = '';
+    for (let rowIndex = best.rowIndex + 1; rowIndex < rows.length; rowIndex++) {
+      const row = rows[rowIndex] || [];
+      if (!row.some(function (cell) { return tripText_(cell); })) { carriedRoom = ''; continue; }
+      const explicitRoom = tripRoomValue_(row[best.room]);
+      if (explicitRoom) carriedRoom = explicitRoom;
+      const room = explicitRoom || carriedRoom;
+      const names = [];
+      best.names.forEach(function (column) { Array.prototype.push.apply(names, tripRoomSplitNames_(row[column])); });
+      const ids = best.ids.map(function (column) { return tripRoomNormalizeId_(row[column]); });
+      if (!names.length && !ids.some(Boolean)) continue;
+      const count = Math.max(names.length, ids.length);
+      if (!room) {
+        issues.push({ source: '工作表' + (tableIndex + 1) + ' 第' + (rowIndex + 1) + '列', value: names.join('、') || ids.join('、'), reason: 'missing_room' });
+        continue;
+      }
+      for (let index = 0; index < count; index++) {
+        result.push({ source: '工作表' + (tableIndex + 1) + ' 第' + (rowIndex + 1) + '列',
+          employeeId: ids[index] || '', name: names[index] || '', room: room });
+        if (result.length > TRIP_ROOM_IMPORT_MAX_ASSIGNMENTS) throw new Error('Too many assignments');
+      }
+    }
+  });
+  return { candidates: result, issues: issues, headerFound: headerFound };
+}
+
+function tripRoomTextCandidates_(text) {
+  if (typeof text !== 'string' || !text.trim() || text.length > 20000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) {
+    return { error: 'invalid_text' };
+  }
+  text = text.trim();
+  if (text.indexOf('房號批次更新') === 0) text = text.slice(6).replace(/^[\s:：]+/, '');
+  if (!text) return { error: 'invalid_text' };
+  const candidates = [], issues = [], lines = text.split(/\r?\n/);
+  if (lines.length > TRIP_ROOM_IMPORT_MAX_ROWS) return { error: 'too_many_rows' };
+  lines.forEach(function (line, index) {
+    const value = tripText_(line);
+    if (!value || value === '房號批次更新' || /^房號\s*(?:姓名|入住人)/.test(value)) return;
+    const match = value.match(/^([^\s:：,，\t]{1,40})[\s:：,，\t]+(.+)$/);
+    if (!match) { issues.push({ source: '第' + (index + 1) + '列', value: value.slice(0, 80), reason: 'invalid_row' }); return; }
+    const room = tripRoomValue_(match[1]), names = tripRoomSplitNames_(match[2]);
+    if (!room || !names.length) { issues.push({ source: '第' + (index + 1) + '列', value: value.slice(0, 80), reason: 'invalid_row' }); return; }
+    names.forEach(function (name) { candidates.push({ source: '第' + (index + 1) + '列', employeeId: '', name: name, room: room }); });
+  });
+  if (candidates.length > TRIP_ROOM_IMPORT_MAX_ASSIGNMENTS) return { error: 'too_many_rows' };
+  return { candidates: candidates, issues: issues, headerFound: true };
+}
+
+function tripRoomEmployeeData_(ss) {
+  const table = tripEmployees_(ss);
+  if (tripText_(table.headers[5]) !== '房間號碼' || tripText_(table.headers[9]) !== '管理權限') throw new Error('Invalid employee schema');
+  const formulas = table.rows.length ? table.sheet.getRange(2, 6, table.rows.length, 1).getFormulas() : [];
+  return { table: table, formulas: formulas };
+}
+
+function tripRoomEmployeeRevision_(row, formula) {
+  return tripDigest_(JSON.stringify(row.slice(0, 10).map(tripText_).concat([tripText_(formula)])));
+}
+
+function tripRoomIssueLines_(issues, limit) {
+  const labels = { missing_room: '缺少房號', invalid_row: '格式錯誤', ambiguous_employee: '重複姓名或編號',
+    employee_not_found: '查無', employee_disabled: '停用', room_formula_protected: '原房號為公式',
+    conflicting_room: '房號衝突', identity_mismatch: '姓名與員編不一致' };
+  return issues.slice(0, limit).map(function (issue) {
+    return tripMessageText_(issue.value || issue.source || '未辨識資料', 60) + '：' + (labels[issue.reason] || '未匯入');
+  });
+}
+
+function tripRoomPreview_(ss, ownerHash, parsed) {
+  const employeeData = tripRoomEmployeeData_(ss), table = employeeData.table;
+  const ids = Object.create(null), names = Object.create(null);
+  table.rows.forEach(function (row, index) {
+    const entry = { row: row, rowNumber: index + 2, formula: tripText_((employeeData.formulas[index] || [])[0]) };
+    const id = tripRoomNormalizeId_(row[0]), name = tripRoomNormalizeName_(row[1]);
+    if (id) { if (!ids[id]) ids[id] = []; ids[id].push(entry); }
+    if (name) { if (!names[name]) names[name] = []; names[name].push(entry); }
+  });
+  const issues = (parsed.issues || []).slice(0, 200), selected = Object.create(null);
+  let issueCount = (parsed.issues || []).length;
+  parsed.candidates.forEach(function (candidate) {
+    const id = tripRoomNormalizeId_(candidate.employeeId), name = tripRoomNormalizeName_(candidate.name);
+    let matches = null;
+    if (id) matches = ids[id] && ids[id].length === 1 ? ids[id] : null;
+    else if (name && names[name] && names[name].length === 1) matches = names[name];
+    let reason = '';
+    if (!matches) reason = (id && ids[id] && ids[id].length > 1) || (!id && name && names[name] && names[name].length > 1) ? 'ambiguous_employee' : 'employee_not_found';
+    else if (name && tripRoomNormalizeName_(matches[0].row[1]) !== name) reason = 'identity_mismatch';
+    else if (tripText_(matches[0].row[4]) !== '啟用') reason = 'employee_disabled';
+    else if (matches[0].formula) reason = 'room_formula_protected';
+    if (reason) {
+      issueCount++;
+      if (issues.length < 200) issues.push({ source: candidate.source, value: candidate.name || candidate.employeeId, room: candidate.room, reason: reason });
+      return;
+    }
+    const match = matches[0], key = tripRoomNormalizeId_(match.row[0]);
+    const assignment = { rowNumber: match.rowNumber, employeeId: key, name: tripText_(match.row[1]), room: candidate.room,
+      previousRoom: tripText_(match.row[5]), revision: tripRoomEmployeeRevision_(match.row, match.formula) };
+    if (!selected[key]) selected[key] = { assignment: assignment, conflict: false };
+    else if (selected[key].assignment.room !== assignment.room) {
+      selected[key].conflict = true;
+      issueCount++;
+      if (issues.length < 200) issues.push({ source: candidate.source, value: assignment.name, room: candidate.room, reason: 'conflicting_room' });
+    }
+  });
+  const assignments = Object.keys(selected).filter(function (key) { return !selected[key].conflict; })
+    .map(function (key) { return selected[key].assignment; }).sort(function (a, b) { return a.rowNumber - b.rowNumber; });
+  if (!assignments.length) {
+    const noRowsSamples = tripRoomIssueLines_(issues, 6);
+    return { success: true, status: 'no_rows', summary: ('沒有可匯入的房號資料。請確認姓名、員工編號與房號欄位。' +
+      (noRowsSamples.length ? '\n' + noRowsSamples.join('\n') : '') +
+      (issueCount > noRowsSamples.length ? '\n其餘 ' + (issueCount - noRowsSamples.length) + ' 筆未列出。' : '')).slice(0, 1800),
+    inputCount: parsed.candidates.length, matchedCount: 0, issueCount: issueCount, issues: issues };
+  }
+  const importId = tripRoomCacheSave_(ownerHash, assignments);
+  if (!importId) return tripStatus_('preview_too_large');
+  const samples = assignments.slice(0, 8).map(function (assignment) { return assignment.name + ' → ' + assignment.room; });
+  const issueSamples = tripRoomIssueLines_(issues, 6);
+  const issueText = issueCount ? '\n未匯入 ' + issueCount + ' 筆：\n' + issueSamples.join('\n') +
+    (issueCount > issueSamples.length ? '\n其餘 ' + (issueCount - issueSamples.length) + ' 筆未列出。' : '') : '';
+  const summary = '已辨識 ' + assignments.length + ' 人，待確認寫入。\n' + samples.join('\n') +
+    (assignments.length > samples.length ? '\n其餘 ' + (assignments.length - samples.length) + ' 人未列出。' : '') + issueText;
+  return { success: true, status: 'preview', importId: importId, expiresInSeconds: TRIP_ROOM_IMPORT_TTL_SECONDS,
+    canConfirm: true, summary: summary.slice(0, 1800), inputCount: parsed.candidates.length, matchedCount: assignments.length,
+    issueCount: issueCount, matched: assignments.slice(0, 200).map(function (assignment) {
+      return { name: assignment.name, room: assignment.room, previousRoom: assignment.previousRoom };
+    }), issues: issues };
+}
+
+function tripRoomConfirm_(ss, request) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(4000)) return tripStatus_('busy');
+  try {
+    const access = tripRoomAdminAccess_(ss, request.lineUserId);
+    if (!access) return tripStatus_('forbidden');
+    const saved = tripRoomCacheRead_(request.importId, access.ownerHash);
+    if (!saved) return tripStatus_('expired');
+    if (!saved.assignments.length || saved.assignments.length > TRIP_ROOM_IMPORT_MAX_ASSIGNMENTS) return tripStatus_('invalid_request');
+    const data = tripRoomEmployeeData_(ss), rows = data.table.rows;
+    for (let index = 0; index < saved.assignments.length; index++) {
+      const assignment = saved.assignments[index], rowIndex = assignment.rowNumber - 2;
+      const row = rows[rowIndex], formula = tripText_((data.formulas[rowIndex] || [])[0]);
+      if (!row || tripRoomNormalizeId_(row[0]) !== assignment.employeeId || formula ||
+          tripRoomEmployeeRevision_(row, formula) !== assignment.revision) return tripStatus_('stale');
+    }
+    const range = data.table.sheet.getRange(2, 6, rows.length, 1), values = range.getValues(), formulas = range.getFormulas();
+    saved.assignments.forEach(function (assignment) { values[assignment.rowNumber - 2][0] = assignment.room; });
+    const output = values.map(function (row, index) {
+      const formula = tripText_((formulas[index] || [])[0]);
+      return [formula || row[0]];
+    });
+    range.setValues(output);
+    SpreadsheetApp.flush();
+    CacheService.getScriptCache().remove(tripRoomImportKey_(request.importId));
+    return { success: true, status: 'ok', summary: '已更新 ' + saved.assignments.length + ' 人的房號。',
+      updatedCount: saved.assignments.length };
+  } finally { lock.releaseLock(); }
+}
+
+function tripRoomCancel_(ss, request) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(4000)) return tripStatus_('busy');
+  try {
+    const access = tripRoomAdminAccess_(ss, request.lineUserId);
+    if (!access) return tripStatus_('forbidden');
+    const saved = tripRoomCacheRead_(request.importId, access.ownerHash);
+    if (!saved) return tripStatus_('expired');
+    CacheService.getScriptCache().remove(tripRoomImportKey_(request.importId));
+    return { success: true, status: 'ok', summary: '已取消，本次房號資料沒有寫入。' };
+  } finally { lock.releaseLock(); }
+}
+
+function tripRoomAdmin_(ss, request) {
+  const operation = request.operation;
+  if (!['authorize', 'previewText', 'previewFile', 'confirm', 'cancel'].includes(operation)) return tripStatus_('invalid_request');
+  if (operation === 'confirm' || operation === 'cancel') {
+    if (!tripRoomImportId_(request.importId)) return tripStatus_('invalid_request');
+    return operation === 'confirm' ? tripRoomConfirm_(ss, request) : tripRoomCancel_(ss, request);
+  }
+  const access = tripRoomAdminAccess_(ss, request.lineUserId);
+  if (!access) return tripStatus_('forbidden');
+  if (operation === 'authorize') return tripStatus_('approved');
+  let parsed;
+  if (operation === 'previewText') parsed = tripRoomTextCandidates_(request.text);
+  else {
+    if (typeof request.fileName !== 'string' || request.fileName.length < 1 || request.fileName.length > 255 ||
+        /[\\/\u0000-\u001f\u007f]/.test(request.fileName) || !Number.isInteger(request.fileSize) ||
+        request.fileSize < 1 || request.fileSize > TRIP_ROOM_IMPORT_MAX_FILE_BYTES || typeof request.fileBase64 !== 'string' ||
+        request.fileBase64.length > Math.ceil(TRIP_ROOM_IMPORT_MAX_FILE_BYTES * 4 / 3) + 8 ||
+        !/^[A-Za-z0-9+/]*={0,2}$/.test(request.fileBase64)) return tripStatus_('invalid_request');
+    let bytes;
+    try { bytes = Utilities.base64Decode(request.fileBase64); }
+    catch (ignored) { return tripStatus_('invalid_request'); }
+    if (bytes.length !== request.fileSize) return tripStatus_('invalid_request');
+    let workbook;
+    try { workbook = tripRoomWorkbookTables_(request.fileName, bytes); }
+    catch (ignored) { return tripStatus_('invalid_file'); }
+    if (workbook.error) return tripStatus_(workbook.error);
+    try { parsed = tripRoomCandidatesFromTables_(workbook.tables); }
+    catch (ignored) { return tripStatus_('file_too_large'); }
+  }
+  if (parsed.error) return tripStatus_(parsed.error);
+  if (!parsed.headerFound) return tripStatus_('columns_not_found');
+  if (!parsed.candidates.length && !(parsed.issues && parsed.issues.length)) return tripStatus_('no_rows');
+  return tripRoomPreview_(ss, access.ownerHash, parsed);
+}
+
