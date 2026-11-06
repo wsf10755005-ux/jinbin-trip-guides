@@ -5,7 +5,7 @@ const TRIP_APPROVED_STATUS = '已核准';
 const TRIP_PENDING_STATUS = '待審核';
 
 function doGet() {
-  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'room-import-20261105' });
+  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'roster-import-20261106' });
 }
 
 function doPost(e) {
@@ -718,15 +718,18 @@ function tripRoomCacheRead_(importId, ownerHash) {
   if (!text) return null;
   let saved;
   try { saved = JSON.parse(text); } catch (ignored) { return null; }
-  if (!saved || saved.version !== 1 || saved.ownerHash !== ownerHash || !Array.isArray(saved.assignments) ||
+  if (!saved || ![1, 2].includes(saved.version) || saved.ownerHash !== ownerHash || !Array.isArray(saved.assignments) ||
       !Number.isFinite(saved.expiresAt) || saved.expiresAt <= Date.now()) return null;
+  if (saved.version === 1 && !saved.kind) saved.kind = 'room';
+  if (!['room', 'roster'].includes(saved.kind)) return null;
   return saved;
 }
 
-function tripRoomCacheSave_(ownerHash, assignments) {
+function tripRoomCacheSave_(ownerHash, assignments, kind, metadata) {
   const importId = Utilities.getUuid();
-  const saved = { version: 1, ownerHash: ownerHash, expiresAt: Date.now() + TRIP_ROOM_IMPORT_TTL_SECONDS * 1000,
-    assignments: assignments };
+  const saved = { version: 2, kind: kind || 'room', ownerHash: ownerHash,
+    expiresAt: Date.now() + TRIP_ROOM_IMPORT_TTL_SECONDS * 1000, assignments: assignments };
+  if (metadata && typeof metadata === 'object') saved.metadata = metadata;
   const text = JSON.stringify(saved);
   if (Utilities.newBlob(text, 'application/json').getBytes().length > TRIP_ROOM_IMPORT_MAX_CACHE_BYTES) return null;
   CacheService.getScriptCache().put(tripRoomImportKey_(importId), text, TRIP_ROOM_IMPORT_TTL_SECONDS);
@@ -785,7 +788,7 @@ function tripRoomWorksheetRows_(xml, sharedStrings) {
     const rowIndex = rowAttribute ? Number(rowAttribute[1]) - 1 : rows.length;
     if (!Number.isInteger(rowIndex) || rowIndex < 0 || rowIndex >= TRIP_ROOM_IMPORT_MAX_ROWS) throw new Error('Workbook too large');
     if (!rows[rowIndex]) rows[rowIndex] = [];
-    const cellExpression = /<c\b([^>]*)>([\s\S]*?)<\/c>/gi;
+    const cellExpression = /<c\b([^>]*?)(?:\/\s*>|>([\s\S]*?)<\/c>)/gi;
     let cellMatch;
     while ((cellMatch = cellExpression.exec(rowMatch[2])) !== null) {
       const reference = cellMatch[1].match(/\br="([^"]+)"/i);
@@ -793,10 +796,11 @@ function tripRoomWorksheetRows_(xml, sharedStrings) {
       const column = tripRoomColumnIndex_(reference[1]);
       if (column < 0 || column >= TRIP_ROOM_IMPORT_MAX_COLUMNS) continue;
       if (++populated > TRIP_ROOM_IMPORT_MAX_CELLS) throw new Error('Workbook too large');
+      const body = cellMatch[2] || '';
       const type = (cellMatch[1].match(/\bt="([^"]+)"/i) || [])[1] || '';
-      const raw = (cellMatch[2].match(/<v(?:\s[^>]*)?>([\s\S]*?)<\/v>/i) || [])[1];
+      const raw = (body.match(/<v(?:\s[^>]*)?>([\s\S]*?)<\/v>/i) || [])[1];
       let value = '';
-      if (type === 'inlineStr') value = tripRoomXmlRuns_(cellMatch[2]);
+      if (type === 'inlineStr') value = tripRoomXmlRuns_(body);
       else if (type === 's') {
         const index = Number(tripRoomXmlDecode_(raw));
         value = Number.isInteger(index) && index >= 0 && index < sharedStrings.length ? sharedStrings[index] : '';
@@ -957,6 +961,101 @@ function tripRoomHeaderType_(value) {
   return '';
 }
 
+// Registration rosters use the travel agency's existing workbook layout.
+// Only columns that already exist in 員工名單 are staged. Dependants and
+// employees marked 不參加 are deliberately ignored.
+function tripRosterHeaderType_(value) {
+  const key = tripRoomHeaderKey_(value);
+  const roomType = tripRoomHeaderType_(value);
+  if (roomType === 'id' || roomType === 'name' || roomType === 'room') return roomType;
+  if (['部門', '單位', 'department', 'dept'].includes(key)) return 'department';
+  if (['參加aorb', '參加方案', '參加行程', '方案', '路線', '路線id', 'route', 'routeid'].includes(key)) return 'route';
+  if (['不參加', '未參加', '不報名'].includes(key)) return 'notParticipating';
+  if (['眷屬', '家屬', 'dependent'].includes(key)) return 'dependent';
+  if (['狀態', 'status'].includes(key)) return 'status';
+  if (['車次', '班次', 'vehicle', 'coach'].includes(key)) return 'vehicle';
+  if (['用餐座位', '用餐桌次', '桌次', '餐桌', 'diningseat', 'diningtable', 'mealseat'].includes(key)) return 'dining';
+  return '';
+}
+
+function tripRosterRoute_(value) {
+  const key = tripText_(value).normalize('NFKC').toUpperCase().replace(/[\s_\-.:：／\/()（）]/g, '');
+  if (['A', 'A案', '方案A', 'R01'].includes(key)) return 'R01';
+  if (['B', 'B案', '方案B', 'R02'].includes(key)) return 'R02';
+  return '';
+}
+
+function tripRosterTruthy_(value) {
+  const key = tripText_(value).normalize('NFKC').toLowerCase().replace(/\s+/g, '');
+  return ['1', 'true', 'yes', 'y', '是', '有', 'v', '✓', '✔'].includes(key);
+}
+
+function tripRosterStatus_(value) {
+  const status = tripRoomValue_(value);
+  if (!status) return '';
+  return ['啟用', '停用'].includes(status) ? status : null;
+}
+
+function tripRosterEmployeeId_(value) {
+  const id = tripRoomValue_(value);
+  return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(id) ? id : '';
+}
+
+function tripRosterCandidatesFromTables_(tables) {
+  const candidates = [], issues = [];
+  let headerFound = false, ignoredCount = 0;
+  tables.forEach(function (rows, tableIndex) {
+    let best = null;
+    for (let rowIndex = 0; rowIndex < Math.min(rows.length, 30); rowIndex++) {
+      const columns = Object.create(null);
+      (rows[rowIndex] || []).slice(0, TRIP_ROOM_IMPORT_MAX_COLUMNS).forEach(function (cell, column) {
+        const type = tripRosterHeaderType_(cell);
+        if (type && columns[type] === undefined) columns[type] = column;
+      });
+      if (columns.id !== undefined && columns.name !== undefined && columns.route !== undefined) {
+        const score = 20 + ['department', 'notParticipating', 'dependent', 'status', 'room', 'vehicle', 'dining']
+          .filter(function (type) { return columns[type] !== undefined; }).length - rowIndex / 100;
+        if (!best || score > best.score) best = { rowIndex: rowIndex, columns: columns, score: score };
+      }
+    }
+    if (!best) return;
+    headerFound = true;
+    for (let rowIndex = best.rowIndex + 1; rowIndex < rows.length; rowIndex++) {
+      const row = rows[rowIndex] || [], columns = best.columns;
+      const source = '工作表' + (tableIndex + 1) + ' 第' + (rowIndex + 1) + '列';
+      const rawId = columns.id === undefined ? '' : row[columns.id];
+      const rawName = columns.name === undefined ? '' : row[columns.name];
+      const rawRoute = columns.route === undefined ? '' : row[columns.route];
+      const employeeId = tripRosterEmployeeId_(rawId), name = tripRoomValue_(rawName);
+      if (!employeeId && !name && !tripText_(rawRoute)) continue;
+      if ((columns.dependent !== undefined && tripRosterTruthy_(row[columns.dependent])) ||
+          (!tripText_(rawRoute) && columns.notParticipating !== undefined && tripRosterTruthy_(row[columns.notParticipating]))) {
+        ignoredCount++;
+        continue;
+      }
+      const route = tripRosterRoute_(rawRoute);
+      let reason = '';
+      if (!employeeId) reason = tripText_(rawId) ? 'invalid_employee_id' : 'missing_employee_id';
+      else if (!name) reason = 'missing_name';
+      else if (!tripText_(rawRoute)) reason = 'missing_route';
+      else if (!route) reason = 'invalid_route';
+      const status = columns.status === undefined ? '' : tripRosterStatus_(row[columns.status]);
+      if (!reason && status === null) reason = 'invalid_status';
+      if (reason) {
+        issues.push({ source: source, value: name || employeeId || tripText_(rawRoute), reason: reason });
+        continue;
+      }
+      candidates.push({ source: source, employeeId: employeeId, name: name, route: route, status: status || '',
+        room: columns.room === undefined ? '' : tripRoomValue_(row[columns.room]),
+        vehicle: columns.vehicle === undefined ? '' : tripRoomValue_(row[columns.vehicle]),
+        dining: columns.dining === undefined ? '' : tripRoomValue_(row[columns.dining]),
+        department: columns.department === undefined ? '' : tripRoomValue_(row[columns.department]) });
+      if (candidates.length > TRIP_ROOM_IMPORT_MAX_ASSIGNMENTS) throw new Error('Too many assignments');
+    }
+  });
+  return { candidates: candidates, issues: issues, headerFound: headerFound, ignoredCount: ignoredCount };
+}
+
 function tripRoomSplitNames_(value) {
   const text = tripText_(value).normalize('NFKC');
   if (!text) return [];
@@ -1047,6 +1146,198 @@ function tripRoomEmployeeRevision_(row, formula) {
   return tripDigest_(JSON.stringify(row.slice(0, 10).map(tripText_).concat([tripText_(formula)])));
 }
 
+function tripRosterEmployeeData_(ss) {
+  const table = tripEmployees_(ss);
+  const expected = ['員工ID', '姓名', '路線ID', '驗證識別碼雜湊', '狀態', '房間號碼', '車次', '用餐座位', '部門', '管理權限'];
+  expected.forEach(function (header, index) {
+    if (tripText_(table.headers[index]) !== header) throw new Error('Invalid employee schema');
+  });
+  const formulas = table.rows.length ? table.sheet.getRange(2, 1, table.rows.length, 10).getFormulas() : [];
+  return { table: table, formulas: formulas };
+}
+
+function tripRosterEmployeeRevision_(row, formulas) {
+  return tripDigest_(JSON.stringify(row.slice(0, 10).map(tripText_).concat(
+    (formulas || []).slice(0, 10).map(tripText_))));
+}
+
+function tripRosterIssueLines_(issues, limit) {
+  const labels = { missing_employee_id: '缺少員工編號', invalid_employee_id: '員工編號格式錯誤', missing_name: '缺少姓名', missing_route: '未選 A 或 B',
+    invalid_route: '方案不是 A 或 B', invalid_status: '狀態只能是啟用或停用', duplicate_file_id: '檔案內員工編號重複',
+    duplicate_file_name: '檔案內姓名重複', ambiguous_employee: '資料庫員工編號重複',
+    identity_mismatch: '姓名與員編不一致', name_exists_with_different_id: '姓名已屬於其他員編',
+    protected_formula: '資料庫欄位為公式' };
+  return issues.slice(0, limit).map(function (issue) {
+    return tripMessageText_(issue.value || issue.source || '未辨識資料', 60) + '：' + (labels[issue.reason] || '未匯入');
+  });
+}
+
+function tripRosterSummary_(counts, samples, issues, ignoredCount, noChanges) {
+  const lines = [noChanges ? '員工名單沒有需要寫入的變更。' : '員工名單已整理完成，請確認後寫入。',
+    '新增 ' + counts.new + ' 人', '更新 ' + counts.updated + ' 人', '無變更 ' + counts.unchanged + ' 人'];
+  if (ignoredCount) lines.push('略過眷屬或不參加 ' + ignoredCount + ' 人');
+  if (counts.conflict) lines.push('未匯入 ' + counts.conflict + ' 筆');
+  if (samples && samples.length) lines.push('', samples.join('\n'));
+  const issueSamples = tripRosterIssueLines_(issues || [], 6);
+  if (issueSamples.length) {
+    lines.push('', '請檢查：', issueSamples.join('\n'));
+    if (counts.conflict > issueSamples.length) lines.push('其餘 ' + (counts.conflict - issueSamples.length) + ' 筆未列出。');
+  }
+  return lines.join('\n').slice(0, 1800);
+}
+
+function tripRosterPreview_(ss, ownerHash, parsed) {
+  const employeeData = tripRosterEmployeeData_(ss), table = employeeData.table;
+  const ids = Object.create(null), names = Object.create(null);
+  table.rows.forEach(function (row, index) {
+    const entry = { row: row, rowNumber: index + 2, formulas: employeeData.formulas[index] || [] };
+    const id = tripRoomNormalizeId_(row[0]), name = tripRoomNormalizeName_(row[1]);
+    if (id) { if (!ids[id]) ids[id] = []; ids[id].push(entry); }
+    if (name) { if (!names[name]) names[name] = []; names[name].push(entry); }
+  });
+  const fileIds = Object.create(null), fileNames = Object.create(null);
+  parsed.candidates.forEach(function (candidate) {
+    const id = tripRoomNormalizeId_(candidate.employeeId), name = tripRoomNormalizeName_(candidate.name);
+    if (!fileIds[id]) fileIds[id] = [];
+    fileIds[id].push(candidate);
+    if (!fileNames[name]) fileNames[name] = [];
+    fileNames[name].push(candidate);
+  });
+  const issues = (parsed.issues || []).slice(0, 200), assignments = [], samples = [];
+  let issueCount = (parsed.issues || []).length, newCount = 0, updatedCount = 0, unchangedCount = 0;
+  parsed.candidates.forEach(function (candidate) {
+    const id = tripRoomNormalizeId_(candidate.employeeId), normalizedName = tripRoomNormalizeName_(candidate.name);
+    let reason = '';
+    if ((fileIds[id] || []).length > 1) reason = 'duplicate_file_id';
+    else if ((fileNames[normalizedName] || []).length > 1) reason = 'duplicate_file_name';
+    const existing = ids[id] || [];
+    if (!reason && existing.length > 1) reason = 'ambiguous_employee';
+    if (!reason && existing.length === 1 && tripRoomNormalizeName_(existing[0].row[1]) !== normalizedName) reason = 'identity_mismatch';
+    if (!reason && !existing.length && names[normalizedName] && names[normalizedName].length) reason = 'name_exists_with_different_id';
+    if (reason) {
+      issueCount++;
+      if (issues.length < 200) issues.push({ source: candidate.source, value: candidate.name || candidate.employeeId, reason: reason });
+      return;
+    }
+    if (!existing.length) {
+      const fields = [candidate.name, candidate.route, candidate.status || '啟用', candidate.room || '', candidate.vehicle || '',
+        candidate.dining || '', candidate.department || ''];
+      assignments.push({ mode: 'new', rowNumber: 0, employeeId: id, revision: '', fields: fields });
+      newCount++;
+      if (samples.length < 8) samples.push('新增 ' + candidate.employeeId + ' ' + candidate.name + ' → ' + candidate.route);
+      return;
+    }
+    const entry = existing[0], row = entry.row;
+    const fields = [tripText_(row[1]), candidate.route, candidate.status || '啟用',
+      candidate.room || tripText_(row[5]), candidate.vehicle || tripText_(row[6]),
+      candidate.dining || tripText_(row[7]), candidate.department || tripText_(row[8])];
+    const targetColumns = [1, 2, 4, 5, 6, 7, 8];
+    let changed = false, protectedFormula = false;
+    targetColumns.forEach(function (column, index) {
+      if (tripText_(row[column]) !== tripText_(fields[index])) {
+        changed = true;
+        if (tripText_(entry.formulas[column])) protectedFormula = true;
+      }
+    });
+    if (protectedFormula) {
+      issueCount++;
+      if (issues.length < 200) issues.push({ source: candidate.source, value: candidate.name, reason: 'protected_formula' });
+      return;
+    }
+    if (!changed) { unchangedCount++; return; }
+    assignments.push({ mode: 'update', rowNumber: entry.rowNumber, employeeId: id,
+      revision: tripRosterEmployeeRevision_(row, entry.formulas), fields: fields });
+    updatedCount++;
+    if (samples.length < 8) samples.push('更新 ' + candidate.employeeId + ' ' + candidate.name + ' → ' + candidate.route);
+  });
+  const counts = { new: newCount, updated: updatedCount, unchanged: unchangedCount, conflict: issueCount };
+  const summary = tripRosterSummary_(counts, samples, issues, parsed.ignoredCount || 0, !assignments.length);
+  if (!assignments.length) return { success: true, status: 'no_rows', kind: 'roster', summary: summary,
+    counts: counts, inputCount: parsed.candidates.length, newCount: newCount, updatedCount: updatedCount,
+    unchangedCount: unchangedCount, issueCount: issueCount, issues: issues };
+  const importId = tripRoomCacheSave_(ownerHash, assignments, 'roster',
+    { counts: counts, samples: samples, ignoredCount: parsed.ignoredCount || 0 });
+  if (!importId) return tripStatus_('preview_too_large');
+  return { success: true, status: 'preview', kind: 'roster', importId: importId,
+    expiresInSeconds: TRIP_ROOM_IMPORT_TTL_SECONDS, canConfirm: true, summary: summary, counts: counts, samples: samples,
+    inputCount: parsed.candidates.length, newCount: newCount, updatedCount: updatedCount,
+    unchangedCount: unchangedCount, issueCount: issueCount, issues: issues };
+}
+
+function tripRosterConfirmSaved_(ss, saved, importId) {
+  if (!saved.assignments.length || saved.assignments.length > TRIP_ROOM_IMPORT_MAX_ASSIGNMENTS) return tripStatus_('invalid_request');
+  const data = tripRosterEmployeeData_(ss), rows = data.table.rows;
+  const ids = Object.create(null), names = Object.create(null);
+  rows.forEach(function (row, index) {
+    const id = tripRoomNormalizeId_(row[0]), name = tripRoomNormalizeName_(row[1]);
+    if (id) { if (!ids[id]) ids[id] = []; ids[id].push(index); }
+    if (name) { if (!names[name]) names[name] = []; names[name].push(id); }
+  });
+  const newIds = Object.create(null), newNames = Object.create(null);
+  for (let index = 0; index < saved.assignments.length; index++) {
+    const assignment = saved.assignments[index], fields = assignment && assignment.fields;
+    if (!assignment || !['new', 'update'].includes(assignment.mode) || !Array.isArray(fields) || fields.length !== 7 ||
+        !tripRosterEmployeeId_(assignment.employeeId) || !['R01', 'R02'].includes(tripText_(fields[1])) ||
+        !['啟用', '停用'].includes(tripText_(fields[2]))) return tripStatus_('invalid_request');
+    if (assignment.mode === 'update') {
+      const rowIndex = assignment.rowNumber - 2, row = rows[rowIndex];
+      if (!row || tripRoomNormalizeId_(row[0]) !== assignment.employeeId ||
+          tripRosterEmployeeRevision_(row, data.formulas[rowIndex] || []) !== assignment.revision) return tripStatus_('stale');
+    } else {
+      const normalizedName = tripRoomNormalizeName_(fields[0]);
+      if ((ids[assignment.employeeId] && ids[assignment.employeeId].length) ||
+          (names[normalizedName] && names[normalizedName].length) || newIds[assignment.employeeId] || newNames[normalizedName]) {
+        return tripStatus_('stale');
+      }
+      newIds[assignment.employeeId] = true;
+      newNames[normalizedName] = true;
+    }
+  }
+  const updates = saved.assignments.filter(function (assignment) { return assignment.mode === 'update'; });
+  const additions = saved.assignments.filter(function (assignment) { return assignment.mode === 'new'; });
+  if (updates.length) {
+    const sortedUpdates = updates.slice().sort(function (a, b) { return a.rowNumber - b.rowNumber; });
+    const groups = [];
+    sortedUpdates.forEach(function (assignment) {
+      const group = groups[groups.length - 1];
+      if (!group || assignment.rowNumber !== group[group.length - 1].rowNumber + 1) groups.push([assignment]);
+      else group.push(assignment);
+    });
+    groups.forEach(function (group) {
+      const firstRow = group[0].rowNumber, height = group.length;
+      const routeRange = data.table.sheet.getRange(firstRow, 3, height, 1);
+      const routeValues = routeRange.getValues(), routeFormulas = routeRange.getFormulas();
+      const detailRange = data.table.sheet.getRange(firstRow, 5, height, 5);
+      const detailValues = detailRange.getValues(), detailFormulas = detailRange.getFormulas();
+      group.forEach(function (assignment, offset) {
+        const fields = assignment.fields;
+        routeValues[offset][0] = fields[1];
+        detailValues[offset] = [fields[2], fields[3], fields[4], fields[5], fields[6]];
+      });
+      routeRange.setValues(routeValues.map(function (row, index) {
+        return [tripText_(routeFormulas[index][0]) || row[0]];
+      }));
+      detailRange.setValues(detailValues.map(function (row, rowIndex) {
+        return row.map(function (value, column) { return tripText_(detailFormulas[rowIndex][column]) || value; });
+      }));
+    });
+  }
+  if (additions.length) {
+    const appendRows = additions.map(function (assignment) {
+      const fields = assignment.fields;
+      return [assignment.employeeId, fields[0], fields[1], '', fields[2], fields[3], fields[4], fields[5], fields[6], ''];
+    });
+    data.table.sheet.getRange(rows.length + 2, 1, appendRows.length, 10).setValues(appendRows);
+  }
+  SpreadsheetApp.flush();
+  CacheService.getScriptCache().remove(tripRoomImportKey_(importId));
+  const metadata = saved.metadata || {}, counts = metadata.counts ||
+    { new: additions.length, updated: updates.length, unchanged: 0, conflict: 0 };
+  return { success: true, status: 'ok', kind: 'roster',
+    summary: '員工名單已更新：新增 ' + additions.length + ' 人、更新 ' + updates.length + ' 人。',
+    counts: counts, newCount: additions.length, updatedCount: updates.length };
+}
+
 function tripRoomIssueLines_(issues, limit) {
   const labels = { missing_room: '缺少房號', invalid_row: '格式錯誤', ambiguous_employee: '重複姓名或編號',
     employee_not_found: '查無', employee_disabled: '停用', room_formula_protected: '原房號為公式',
@@ -1124,6 +1415,7 @@ function tripRoomConfirm_(ss, request) {
     if (!access) return tripStatus_('forbidden');
     const saved = tripRoomCacheRead_(request.importId, access.ownerHash);
     if (!saved) return tripStatus_('expired');
+    if (saved.kind === 'roster') return tripRosterConfirmSaved_(ss, saved, request.importId);
     if (!saved.assignments.length || saved.assignments.length > TRIP_ROOM_IMPORT_MAX_ASSIGNMENTS) return tripStatus_('invalid_request');
     const data = tripRoomEmployeeData_(ss), rows = data.table.rows;
     for (let index = 0; index < saved.assignments.length; index++) {
@@ -1155,6 +1447,8 @@ function tripRoomCancel_(ss, request) {
     const saved = tripRoomCacheRead_(request.importId, access.ownerHash);
     if (!saved) return tripStatus_('expired');
     CacheService.getScriptCache().remove(tripRoomImportKey_(request.importId));
+    if (saved.kind === 'roster') return { success: true, status: 'ok', kind: 'roster',
+      summary: '已取消，本次員工名單沒有寫入。' };
     return { success: true, status: 'ok', summary: '已取消，本次房號資料沒有寫入。' };
   } finally { lock.releaseLock(); }
 }
@@ -1185,6 +1479,13 @@ function tripRoomAdmin_(ss, request) {
     try { workbook = tripRoomWorkbookTables_(request.fileName, bytes); }
     catch (ignored) { return tripStatus_('invalid_file'); }
     if (workbook.error) return tripStatus_(workbook.error);
+    let roster;
+    try { roster = tripRosterCandidatesFromTables_(workbook.tables); }
+    catch (ignored) { return tripStatus_('file_too_large'); }
+    if (roster.headerFound) {
+      if (!roster.candidates.length && !(roster.issues && roster.issues.length)) return tripStatus_('no_rows');
+      return tripRosterPreview_(ss, access.ownerHash, roster);
+    }
     try { parsed = tripRoomCandidatesFromTables_(workbook.tables); }
     catch (ignored) { return tripStatus_('file_too_large'); }
   }
