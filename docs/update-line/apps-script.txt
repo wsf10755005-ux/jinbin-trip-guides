@@ -1086,8 +1086,8 @@ function tripRosterHeaderType_(value) {
   if (['狀態', 'status'].includes(key)) return 'status';
   if (['車次', '班次', 'vehicle', 'coach'].includes(key)) return 'vehicle';
   if (['用餐座位', '用餐桌次', '桌次', '餐桌', 'diningseat', 'diningtable', 'mealseat'].includes(key)) return 'dining';
-  if (['第二天上午選擇', '第二天上午行程', '第二天10:00前選擇', '第二天10點前選擇',
-      '10:00前選擇', '10點前選擇', '上午行程選擇', '晨間選擇'].includes(key)) return 'morningChoice';
+  if (['第二天上午選擇', '第二天上午行程', '第二天1000前選擇', '第二天10點前選擇',
+      '1000前選擇', '10點前選擇', '上午行程選擇', '晨間選擇'].includes(key)) return 'morningChoice';
   return '';
 }
 
