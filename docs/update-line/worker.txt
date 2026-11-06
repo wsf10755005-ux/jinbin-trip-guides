@@ -11,7 +11,7 @@ const TRIP_UNAVAILABLE = '查無此人，請重新輸入';
 const MAX_TEXT_LENGTH = 4999;
 const ROOM_FILE_MAX_BYTES = 3 * 1024 * 1024;
 const ROOM_ADMIN_ONLY = '此功能僅限管理員使用。';
-const ROOM_FILE_ACK = '已收到檔案，正在整理房號資料。完成後會再傳送預覽。';
+const ROOM_FILE_ACK = '已收到檔案，正在整理資料。完成後會再傳送預覽。';
 const ROOM_FILE_TYPES = new Set(['.xlsx', '.csv']);
 // Best-effort deduplication within this Worker isolate. Apps Script must also
 // enforce one binding per LINE user under LockService for cross-isolate races.
@@ -161,41 +161,94 @@ async function roomLinePush(env, lineUserId, value) {
 
 function roomImportSummary(result, operation) {
   if (['forbidden', 'not_admin', 'unbound', 'disabled', 'pending'].includes(result.status)) return ROOM_ADMIN_ONLY;
+  if (result.kind === 'roster' && result.status === 'no_rows' && validText(result.summary) && result.summary.length <= 3800) {
+    return result.summary;
+  }
+  const fileImport = operation === 'previewFile';
   const errors = {
-    invalid_request: '房號資料格式不正確，請確認後重新傳送。',
-    invalid_file: '無法辨識這份檔案，請確認檔案包含姓名或員工編號及房號。',
+    invalid_request: fileImport ? '資料格式不正確，請確認後重新傳送。' : '房號資料格式不正確，請確認後重新傳送。',
+    invalid_file: '無法辨識這份檔案，請確認檔案內有員工名單或房號資料。',
     unsupported_format: '請傳送 .xlsx 或 .csv 檔案；舊式 .xls 請先另存成 .xlsx。',
     encrypted_or_invalid_file: '無法開啟這份 Excel；若檔案有密碼，請先取消密碼後重新傳送。',
-    file_too_large: '檔案內容過大，請只保留房號與人員資料後重新傳送。',
-    columns_not_found: '找不到姓名、員工編號或房號欄位，請確認表頭後重新傳送。',
+    file_too_large: '檔案內容過大，請只保留需要匯入的人員資料後重新傳送。',
+    columns_not_found: '找不到可辨識的員工名單或房號欄位，請確認表頭後重新傳送。',
+    roster_columns_not_found: '找不到員工編號、姓名或方案欄位，請確認名單格式後重新傳送。',
+    invalid_route: '方案欄位只能填 A 或 B，請修正後重新傳送。',
+    duplicate_employee: '名單內有重複的員工編號，請修正後重新傳送。',
     invalid_text: '房號文字格式不正確，請依照範例重新傳送。',
-    too_many_rows: '房號資料筆數過多，請分成兩次匯入。',
+    too_many_rows: '資料筆數過多，請分成兩次匯入。',
     preview_too_large: '匯入資料過多，請分成兩次傳送。',
-    no_rows: '檔案內找不到可匯入的房號資料。',
+    no_rows: '檔案內找不到可匯入的資料。',
     expired: '這份匯入預覽已失效，請重新傳送資料。',
     stale: '員工資料已被修改，為避免覆蓋新資料，請重新傳送並確認。',
     busy: '系統忙碌中，請稍後再試。'
   };
-  if (!['ok', 'preview'].includes(result.status)) return errors[result.status] || '目前無法處理房號資料，請稍後再試。';
-  if (!validText(result.summary) || result.summary.length > 3800) {
+  if (!['ok', 'preview'].includes(result.status)) return errors[result.status] ||
+    (fileImport ? '目前無法處理這份資料，請稍後再試。' : '目前無法處理房號資料，請稍後再試。');
+  const text = result.kind === 'roster'
+    ? rosterImportSummaryText(result, operation)
+    : result.summary;
+  if (!validText(text) || text.length > 3800) {
     throw new EmployeeApiError('APPS_ROOM_SUMMARY_INVALID', { operation });
   }
-  if (!['previewFile', 'previewText'].includes(operation)) return result.summary;
+  if (!['previewFile', 'previewText'].includes(operation)) return text;
   if (typeof result.importId !== 'string' || !/^[A-Za-z0-9_-]{16,80}$/.test(result.importId)) {
     throw new EmployeeApiError('APPS_ROOM_IMPORT_ID_INVALID', { operation });
   }
+  const label = result.kind === 'roster' ? '員工名單' : result.kind === 'room' || operation === 'previewText' ? '房號' : '資料';
   return {
     type: 'text',
-    text: result.summary,
+    text,
     quickReply: {
       items: [
         { type: 'action', action: { type: 'postback', label: '確認匯入',
-          data: `room-import:confirm:${result.importId}`, displayText: '確認匯入房號' } },
+          data: `room-import:confirm:${result.importId}`, displayText: `確認匯入${label}` } },
         { type: 'action', action: { type: 'postback', label: '取消',
-          data: `room-import:cancel:${result.importId}`, displayText: '取消房號匯入' } }
+          data: `room-import:cancel:${result.importId}`, displayText: `取消${label}匯入` } }
       ]
     }
   };
+}
+
+function rosterImportSummaryText(result, operation) {
+  if (validText(result.summary)) return result.summary;
+  const raw = result.counts && typeof result.counts === 'object' && !Array.isArray(result.counts)
+    ? result.counts
+    : result.summary && typeof result.summary === 'object' && !Array.isArray(result.summary)
+      ? result.summary
+      : result;
+  const readCount = (...keys) => {
+    for (const source of raw === result ? [raw] : [raw, result]) {
+      for (const key of keys) {
+        const value = source[key];
+        if (Number.isSafeInteger(value) && value >= 0 && value <= 100000) return value;
+      }
+    }
+    return null;
+  };
+  const counts = {
+    input: readCount('input', 'total', 'inputCount', 'totalCount'),
+    added: readCount('new', 'added', 'newCount', 'addedCount'),
+    updated: readCount('updated', 'update', 'updatedCount', 'updateCount'),
+    unchanged: readCount('unchanged', 'same', 'unchangedCount', 'sameCount'),
+    conflict: readCount('conflict', 'conflicts', 'conflictCount', 'issueCount')
+  };
+  if (operation === 'cancel') return '已取消員工名單匯入。';
+  if (Object.values(counts).every(value => value === null)) return '';
+  const title = operation === 'confirm' ? '員工名單匯入完成' : '員工名單匯入預覽';
+  const lines = [title];
+  if (counts.input !== null) lines.push(`讀取 ${counts.input} 人`);
+  if (counts.added !== null) lines.push(`新增 ${counts.added} 人`);
+  if (counts.updated !== null) lines.push(`更新 ${counts.updated} 人`);
+  if (counts.unchanged !== null) lines.push(`資料相同 ${counts.unchanged} 人`);
+  if (counts.conflict !== null) lines.push(`需確認 ${counts.conflict} 人`);
+  const samples = Array.isArray(result.samples) ? result.samples : Array.isArray(raw.samples) ? raw.samples : [];
+  const safeSamples = samples.slice(0, 5).map(value => typeof value === 'string'
+    ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120)
+    : '').filter(Boolean);
+  if (safeSamples.length) lines.push('', '需確認的資料：', ...safeSamples.map(value => `- ${value}`));
+  if (operation === 'previewFile') lines.push('', '請確認後寫入。');
+  return lines.join('\n');
 }
 
 function roomFileMetadata(message) {
@@ -253,7 +306,7 @@ async function roomDownloadFile(env, metadata) {
 async function handleRoomFileEvent(event, env, now) {
   const lineUserId = event.source?.type === 'user' ? event.source.userId : '';
   if (!lineUserId || !/^U[0-9a-f]{32}$/.test(lineUserId)) {
-    await roomLineReply(env, event.replyToken, '為保護個人資料，請在官方帳號的一對一聊天室匯入房號。');
+    await roomLineReply(env, event.replyToken, '為保護個人資料，請在官方帳號的一對一聊天室匯入資料。');
     return;
   }
   let access;
@@ -288,7 +341,7 @@ async function handleRoomFileEvent(event, env, now) {
     await roomLinePush(env, lineUserId, roomImportSummary(result, 'previewFile'));
   } catch (error) {
     logApiError('Room file import failed', error);
-    await roomLinePush(env, lineUserId, '無法分析這份房號檔案，請確認檔案格式後重新傳送。');
+    await roomLinePush(env, lineUserId, '無法分析這份檔案，請確認檔案格式後重新傳送。');
   }
 }
 
@@ -520,7 +573,7 @@ async function handleAdminRequest(request, env) {
   if (request.method === 'OPTIONS') return adminResponse(null, 204);
   const path = new URL(request.url).pathname;
   if (path === '/admin/health' && request.method === 'GET') {
-    return adminResponse({ service: 'employee-trip', build: 'room-import-20261105',
+    return adminResponse({ service: 'employee-trip', build: 'roster-import-20261106',
       adminConfigured: typeof env.ADMIN_PASSWORD === 'string' && env.ADMIN_PASSWORD.trim().length >= 12 });
   }
   if (!['/admin/login', '/admin/reminders'].includes(path)) return adminResponse({ error: '找不到此功能。' }, 404);
