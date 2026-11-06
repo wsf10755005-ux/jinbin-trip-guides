@@ -29,7 +29,7 @@
 <script>
   const button=document.getElementById('copy'),status=document.getElementById('status'),textarea=document.getElementById('code'),manual=document.getElementById('manual');
   let source='';
-  fetch('./worker.txt?v=roster-import-20261106',{cache:'no-store'}).then(response=>{if(!response.ok)throw Error();return response.text();}).then(text=>{
+  fetch('./worker.txt?v=r02-morning-roster-20261106',{cache:'no-store'}).then(response=>{if(!response.ok)throw Error();return response.text();}).then(text=>{
     if(!text.includes('export default')||!text.includes('完整行程圖片')||!text.includes("type: 'image'"))throw Error();
     source=text;textarea.value=text;button.disabled=false;button.textContent='① 複製更新程式';status.textContent='程式已準備好。';
   }).catch(()=>{button.textContent='載入失敗';status.textContent='請重新整理後再試一次。';});
