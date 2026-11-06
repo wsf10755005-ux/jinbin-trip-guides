@@ -108,11 +108,18 @@ async function handleEvent(event, env) {
     const code = logApiError('Employee API request failed', error);
     text = `${RETRY}\n參考代碼：${code}`;
   }
+  let messages;
+  try {
+    messages = lineReplyMessages(text);
+  } catch (error) {
+    const code = logApiError('LINE reply message validation failed', error);
+    messages = [{ type: 'text', text: `${RETRY}\n參考代碼：${code}` }];
+  }
   try {
     const response = await fetch('https://api.line.me/v2/bot/message/reply', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}` },
-      body: JSON.stringify({ replyToken: event.replyToken, messages: [typeof text === 'string' ? { type: 'text', text } : text] }),
+      body: JSON.stringify({ replyToken: event.replyToken, messages }),
       signal: AbortSignal.timeout(8000)
     });
     if (!response.ok) console.error('LINE reply failed', response.status);
@@ -121,6 +128,22 @@ async function handleEvent(event, env) {
       catch (error) { logApiError('Guide menu sync failed', error); }
     }
   } catch { console.error('LINE reply request failed'); }
+}
+
+function lineReplyMessages(value) {
+  const values = Array.isArray(value) ? value : [value];
+  if (values.length < 1 || values.length > 5) throw new EmployeeApiError('LINE_MESSAGES_INVALID');
+  return values.map(item => {
+    if (typeof item === 'string') {
+      if (!validText(item)) throw new EmployeeApiError('LINE_MESSAGES_INVALID');
+      return { type: 'text', text: item };
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new EmployeeApiError('LINE_MESSAGES_INVALID');
+    if (item.type === 'text' && validText(item.text)) return item;
+    if (item.type === 'image' && validImageUrl(item.originalContentUrl) && validImageUrl(item.previewImageUrl)) return item;
+    throw new EmployeeApiError('LINE_MESSAGES_INVALID');
+    return item;
+  });
 }
 
 function roomLineMessage(value) {
@@ -348,8 +371,12 @@ async function handleRoomFileEvent(event, env, now) {
 async function syncGuideMenu(lineUserId, env) {
   // Query approved binding, never infer the route from a name or user input.
   const access = await appsScript(env, 'lookup', { lineUserId }, Date.now() + 12000);
-  const menuId = access.status === 'approved' && GUIDE_RICH_MENUS[access.employee?.routeId];
-  const remove = ['unbound', 'disabled', 'pending', 'bind_rejected'].includes(access.status);
+  const routeIds = Array.isArray(access.employee?.routeIds)
+    ? access.employee.routeIds.filter(value => typeof value === 'string')
+    : access.employee?.routeId ? [access.employee.routeId] : [];
+  const menuId = access.status === 'approved' && routeIds.length === 1 && GUIDE_RICH_MENUS[routeIds[0]];
+  const remove = ['unbound', 'disabled', 'pending', 'bind_rejected'].includes(access.status) ||
+    (access.status === 'approved' && routeIds.length > 1);
   if (!menuId && !remove) return;
   const endpoint = `https://api.line.me/v2/bot/user/${encodeURIComponent(lineUserId)}/richmenu`;
   const response = await fetch(menuId ? `${endpoint}/${menuId}` : endpoint, {
@@ -448,31 +475,44 @@ async function buildReply(message, lineUserId, env, deadline) {
   if (!topic && (!input || input.length > 50 || /[\u0000-\u001f\u007f]/.test(input))) return HELP;
   const result = await appsScript(env, 'portal', topic ? { lineUserId, topic } : { lineUserId, name: input }, deadline);
   if (result.status === 'approved') {
-    let imageUrl = topic === '桌次' ? result.imageUrl : undefined;
+    const morningMessage = topic === '行程' ? r02MorningMessage(result) : null;
+    let usedItineraryFallback = false;
+    let imageUrls = topic === '桌次'
+      ? result.imageUrls !== undefined ? result.imageUrls : result.imageUrl !== undefined ? [result.imageUrl] : undefined
+      : undefined;
     if (topic === '行程') {
-      imageUrl = result.imageUrl;
-      if (imageUrl === undefined) {
+      imageUrls = result.imageUrls !== undefined ? result.imageUrls : result.imageUrl !== undefined ? [result.imageUrl] : undefined;
+      if (imageUrls === undefined) {
         if (!validText(result.reply)) throw new EmployeeApiError('APPS_REPLY_INVALID', { action: 'trip' });
         // The Sheet links this note to the route's image URL. This also works
         // with the existing Apps Script deployment, without changing it.
-        imageUrl = result.reply.match(/完整行程圖片[：:][ \t]*(https?:\/\/\S+)/iu)?.[1];
+        usedItineraryFallback = true;
+        imageUrls = Array.from(result.reply.matchAll(/完整行程圖片[：:][ \t]*(https?:\/\/\S+)/giu), match => match[1]);
       }
-      if (imageUrl === undefined) return '行程圖片尚未設定，請聯絡旅遊承辦人。';
+      if (usedItineraryFallback && imageUrls.length === 0) {
+        const missingImage = '行程圖片尚未設定，請聯絡旅遊承辦人。';
+        return morningMessage ? [missingImage, morningMessage] : missingImage;
+      }
     }
-    if (imageUrl !== undefined) {
-      if (typeof imageUrl !== 'string') throw new EmployeeApiError('APPS_IMAGE_INVALID');
-      let url;
-      try { url = new URL(imageUrl); } catch { throw new EmployeeApiError('APPS_IMAGE_INVALID'); }
-      if (url.protocol !== 'https:' || url.username || url.password || url.toString().length > 2000) {
+    if (imageUrls !== undefined) {
+      if (!Array.isArray(imageUrls) || imageUrls.length < 1 || imageUrls.length > 5) {
         throw new EmployeeApiError('APPS_IMAGE_INVALID');
       }
-      return { type: 'image', originalContentUrl: url.toString(), previewImageUrl: url.toString() };
+      const messages = imageUrls.map(imageUrl => {
+        const url = validImageUrl(imageUrl);
+        if (!url) throw new EmployeeApiError('APPS_IMAGE_INVALID');
+        return { type: 'image', originalContentUrl: url.toString(), previewImageUrl: url.toString() };
+      });
+      if (morningMessage) messages.push({ type: 'text', text: morningMessage });
+      if (messages.length > 5) throw new EmployeeApiError('LINE_MESSAGES_INVALID');
+      return messages.length === 1 ? messages[0] : messages;
     }
     // Only the approved, bounded itinerary text is rendered. Never render
     // employee objects, IDs, raw API messages or arbitrary response fields.
     if (!validText(result.reply)) {
       throw new EmployeeApiError('APPS_REPLY_INVALID', { action: 'trip' });
     }
+    if (topic && morningMessage) return [result.reply, morningMessage];
     return topic ? result.reply : BIND_SUCCESS;
   }
   if (['unbound', 'disabled', 'pending', 'bind_rejected'].includes(result.status) && topic) return NAME_REQUIRED;
@@ -480,8 +520,27 @@ async function buildReply(message, lineUserId, env, deadline) {
   return TRIP_UNAVAILABLE;
 }
 
+function r02MorningMessage(result) {
+  if (result.r02MorningChoiceStatus === undefined) return null;
+  if (result.r02MorningChoiceStatus === 'missing' && result.r02MorningChoice === undefined) {
+    return 'R02 第二天上午（10:00 前）：尚未安排，請洽旅遊承辦人。';
+  }
+  if (result.r02MorningChoiceStatus === 'set' &&
+      ['飯店設施', '水蛙頭步道'].includes(result.r02MorningChoice)) {
+    return `R02 第二天上午（10:00 前）：${result.r02MorningChoice}`;
+  }
+  throw new EmployeeApiError('APPS_MORNING_CHOICE_INVALID');
+}
+
 function validText(value) {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= MAX_TEXT_LENGTH;
+}
+
+function validImageUrl(value) {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 2000) return false;
+  let url;
+  try { url = new URL(value); } catch { return false; }
+  return url.protocol === 'https:' && !url.username && !url.password && url.toString().length <= 2000 && url;
 }
 
 const ADMIN_ORIGIN = 'https://wsf10755005-ux.github.io';
@@ -573,7 +632,7 @@ async function handleAdminRequest(request, env) {
   if (request.method === 'OPTIONS') return adminResponse(null, 204);
   const path = new URL(request.url).pathname;
   if (path === '/admin/health' && request.method === 'GET') {
-    return adminResponse({ service: 'employee-trip', build: 'roster-import-20261106',
+    return adminResponse({ service: 'employee-trip', build: 'r02-morning-roster-20261106',
       adminConfigured: typeof env.ADMIN_PASSWORD === 'string' && env.ADMIN_PASSWORD.trim().length >= 12 });
   }
   if (!['/admin/login', '/admin/reminders'].includes(path)) return adminResponse({ error: '找不到此功能。' }, 404);
