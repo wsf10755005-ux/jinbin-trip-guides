@@ -7,12 +7,12 @@
     try {
       const r = await fetch('https://employee-trip-line-bot.wsf10755005.workers.dev/admin/health', { cache: 'no-store', signal: AbortSignal.timeout(10000) });
       const result = await r.json();
-      if (!r.ok || result.build !== 'roster-import-20261106') throw Error();
+      if (!r.ok || result.build !== 'r02-morning-roster-20261106') throw Error();
       status.textContent = result.adminConfigured ? 'Worker 已更新，管理密碼已設定。請開啟管理頁登入，核對 Apps Script 連線。' : 'Worker 已更新，還需要設定 ADMIN_PASSWORD 密鑰。';
     } catch { status.textContent = '尚未確認到新版 Worker，請完成第 2 步後再試一次。'; }
     finally { check.disabled = false; }
   });
-  for (const [id, path, label] of [['copy-apps', '../update-line/apps-script.txt?v=roster-import-20261106', 'Apps Script'], ['copy-worker', '../update-line/worker.txt?v=roster-import-20261106', 'Worker']]) {
+  for (const [id, path, label] of [['copy-apps', '../update-line/apps-script.txt?v=r02-morning-roster-20261106', 'Apps Script'], ['copy-worker', '../update-line/worker.txt?v=r02-morning-roster-20261106', 'Worker']]) {
     const button = document.getElementById(id); let source = '';
     fetch(path, { cache: 'no-store' }).then(r => { if (!r.ok) throw Error(); return r.text(); }).then(text => {
       if (!text.includes('adminReminders') && !text.includes('handleAdminRequest')) throw Error();
