@@ -2,9 +2,10 @@ const TABLE_PLACEHOLDERS = {"/images/table-black.png":"iVBORw0KGgoAAAANSUhEUgAAA
 const HELP = '請輸入全名，如:王少甫';
 const BIND_SUCCESS = '綁定成功！\n\n本次兩方案集合地點都在「金賓汽車頂湖廠」\nhttps://share.google/D0maFrCaCc2iNcHVA\n\n請點選下方選單查詢行程、桌次、房號或旅遊攻略。';
 const GUIDE_RICH_MENUS = {
-  R01: 'richmenu-bc1206f22e068c87bc88adc53aa10bc3',
   R02: 'richmenu-855706daa7c8f3e6862c3b7fad970bf3'
 };
+const FUSEN_ROUTES = new Set(['R01', 'R01-AC', 'R01-BD']);
+const FUSEN_ASSIGNMENT_PENDING = '福森號組合尚未設定，請聯絡旅遊承辦人。';
 const RETRY = '目前無法取得行程，請稍後再試。';
 const NAME_REQUIRED = '請先綁定帳號才能查詢喔～';
 const TRIP_UNAVAILABLE = '查無此人，請重新輸入';
@@ -376,7 +377,7 @@ async function syncGuideMenu(lineUserId, env) {
     : access.employee?.routeId ? [access.employee.routeId] : [];
   const menuId = access.status === 'approved' && routeIds.length === 1 && GUIDE_RICH_MENUS[routeIds[0]];
   const remove = ['unbound', 'disabled', 'pending', 'bind_rejected'].includes(access.status) ||
-    (access.status === 'approved' && routeIds.length > 1);
+    (access.status === 'approved' && (routeIds.length > 1 || routeIds.some(routeId => FUSEN_ROUTES.has(routeId))));
   if (!menuId && !remove) return;
   const endpoint = `https://api.line.me/v2/bot/user/${encodeURIComponent(lineUserId)}/richmenu`;
   const response = await fetch(menuId ? `${endpoint}/${menuId}` : endpoint, {
@@ -476,6 +477,8 @@ async function buildReply(message, lineUserId, env, deadline) {
   const result = await appsScript(env, 'portal', topic ? { lineUserId, topic } : { lineUserId, name: input }, deadline);
   if (result.status === 'approved') {
     const morningMessage = topic === '行程' ? r02MorningMessage(result) : null;
+    const pendingMessage = topic && result.routeAssignmentPending === true ? FUSEN_ASSIGNMENT_PENDING : null;
+    const notices = [morningMessage, pendingMessage].filter(Boolean);
     let usedItineraryFallback = false;
     let imageUrls = topic === '桌次'
       ? result.imageUrls !== undefined ? result.imageUrls : result.imageUrl !== undefined ? [result.imageUrl] : undefined
@@ -490,6 +493,7 @@ async function buildReply(message, lineUserId, env, deadline) {
         imageUrls = Array.from(result.reply.matchAll(/完整行程圖片[：:][ \t]*(https?:\/\/\S+)/giu), match => match[1]);
       }
       if (usedItineraryFallback && imageUrls.length === 0) {
+        if (pendingMessage) return notices.length === 1 ? pendingMessage : notices;
         const missingImage = '行程圖片尚未設定，請聯絡旅遊承辦人。';
         return morningMessage ? [missingImage, morningMessage] : missingImage;
       }
@@ -503,7 +507,7 @@ async function buildReply(message, lineUserId, env, deadline) {
         if (!url) throw new EmployeeApiError('APPS_IMAGE_INVALID');
         return { type: 'image', originalContentUrl: url.toString(), previewImageUrl: url.toString() };
       });
-      if (morningMessage) messages.push({ type: 'text', text: morningMessage });
+      for (const notice of notices) messages.push({ type: 'text', text: notice });
       if (messages.length > 5) throw new EmployeeApiError('LINE_MESSAGES_INVALID');
       return messages.length === 1 ? messages[0] : messages;
     }
@@ -512,10 +516,14 @@ async function buildReply(message, lineUserId, env, deadline) {
     if (!validText(result.reply)) {
       throw new EmployeeApiError('APPS_REPLY_INVALID', { action: 'trip' });
     }
-    if (topic && morningMessage) return [result.reply, morningMessage];
+    if (topic && notices.length) {
+      const messages = [result.reply, ...notices.filter(notice => notice !== result.reply)];
+      return messages.length === 1 ? messages[0] : messages;
+    }
     return topic ? result.reply : BIND_SUCCESS;
   }
   if (['unbound', 'disabled', 'pending', 'bind_rejected'].includes(result.status) && topic) return NAME_REQUIRED;
+  if (result.status === 'route_assignment_missing' && topic) return FUSEN_ASSIGNMENT_PENDING;
   if (result.status === 'busy') return '系統忙碌中，請稍後重新輸入。';
   return TRIP_UNAVAILABLE;
 }
@@ -632,7 +640,7 @@ async function handleAdminRequest(request, env) {
   if (request.method === 'OPTIONS') return adminResponse(null, 204);
   const path = new URL(request.url).pathname;
   if (path === '/admin/health' && request.method === 'GET') {
-    return adminResponse({ service: 'employee-trip', build: 'r02-morning-roster-20261106',
+    return adminResponse({ service: 'employee-trip', build: 'fusen-two-batches-20261111',
       adminConfigured: typeof env.ADMIN_PASSWORD === 'string' && env.ADMIN_PASSWORD.trim().length >= 12 });
   }
   if (!['/admin/login', '/admin/reminders'].includes(path)) return adminResponse({ error: '找不到此功能。' }, 404);
@@ -789,4 +797,3 @@ async function deliverReminderBatch(env, batch, deadline) {
   }, deadline);
   if (ack.status !== 'ok') throw new EmployeeApiError('APPS_REMINDER_ACK_INVALID', { action: 'ackReminder' });
 }
-

@@ -6,9 +6,11 @@ const TRIP_PENDING_STATUS = '待審核';
 const TRIP_DEPENDENT_KEY_PREFIX = 'DEP-';
 const TRIP_R02_MORNING_HEADER = '第二天上午選擇';
 const TRIP_R02_MORNING_CHOICES = ['飯店設施', '水蛙頭步道'];
+const TRIP_FUSEN_ROUTES = ['R01-AC', 'R01-BD'];
+const TRIP_FUSEN_PENDING = '福森號組合尚未設定，請聯絡旅遊承辦人。';
 
 function doGet() {
-  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'r02-morning-roster-20261106' });
+  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'fusen-two-batches-20261111' });
 }
 
 function doPost(e) {
@@ -97,7 +99,24 @@ function tripEmployeeRouteIds_(value) {
   const parts = text.split(/[,、+／\/|;；]+/).map(tripText_);
   if (!parts.length || parts.some(function (part) { return !/^[A-Za-z0-9_.-]{1,40}$/.test(part); }) ||
       parts.length > 2 || new Set(parts).size !== parts.length) return null;
+  if (parts.some(function (part) { return /^R01-/i.test(part) && !TRIP_FUSEN_ROUTES.includes(part); })) return null;
+  if (parts.filter(function (part) { return part === 'R01' || TRIP_FUSEN_ROUTES.includes(part); }).length > 1) return null;
   return parts;
+}
+
+function tripFusenPending_(routeIds) {
+  return routeIds.includes('R01') ? TRIP_FUSEN_PENDING : '';
+}
+
+function tripRouteImage_(table, route, header) {
+  const column = table.headers.indexOf(header);
+  const url = column >= 0 ? tripText_(route[column]) : '';
+  return url && /^https:\/\/[^\s]+$/i.test(url) && url.length <= 2000 ? url : '';
+}
+
+function tripReminderApplies_(reminderRoute, participantRoute) {
+  const route = tripText_(reminderRoute);
+  return route === participantRoute || (route === 'R01' && TRIP_FUSEN_ROUTES.includes(participantRoute));
 }
 
 function tripEmployeeRouteValue_(value) {
@@ -166,6 +185,7 @@ function tripPortal_(ss, body) {
     const index = table.headers.indexOf('桌次圖片網址');
     const urls = [];
     for (let routeIndex = 0; routeIndex < routeIds.length; routeIndex++) {
+      if (routeIds[routeIndex] === 'R01') continue;
       const routes = table.rows.filter(function (row) { return tripText_(row[0]) === routeIds[routeIndex]; });
       if (routes.length !== 1) return tripStatus_('route_missing');
       const url = index >= 0 ? tripText_(routes[0][index]) : '';
@@ -173,17 +193,18 @@ function tripPortal_(ss, body) {
     }
     if (urls.length === 1) return { success: true, status: 'approved', imageUrl: urls[0] };
     if (urls.length > 1) return { success: true, status: 'approved', imageUrls: urls };
-    reply = '桌次圖片尚未公布。';
+    reply = tripFusenPending_(routeIds) || '桌次圖片尚未公布。';
   }
   if (body.topic === '旅遊攻略') {
     if (!routeIds || !routeIds.length) return tripStatus_('route_missing');
     const rows = tripTable_(ss, '旅遊攻略', ['路線ID', '標題', '內容或連結', '公開狀態']).rows.filter(function (row) {
-      return routeIds.includes(tripText_(row[0])) && ['', '公開'].includes(tripText_(row[3]));
+      return tripText_(row[0]) !== 'R01' && routeIds.includes(tripText_(row[0])) && ['', '公開'].includes(tripText_(row[3]));
     });
     reply = rows.length ? '旅遊攻略\n' + rows.map(function (row) {
       const routeLabel = routeIds.length > 1 ? '【' + tripMessageText_(row[0], 40) + '】' : '';
       return routeLabel + tripMessageText_(row[1], 150) + '\n' + tripText_(row[2]).slice(0, 2000);
     }).join('\n\n') : '旅遊攻略尚未公布。';
+    if (tripFusenPending_(routeIds)) reply = tripFusenPending_(routeIds) + (rows.length ? '\n\n' + reply : '');
   }
   return { success: true, status: 'approved', reply: reply.slice(0, 4500) };
 }
@@ -308,9 +329,13 @@ function tripItinerary_(ss, lineUserId, name) {
   if (access.status !== 'approved') return access;
   const routeIds = access.employee.routeIds || tripEmployeeRouteIds_(access.employee.routeId);
   if (!routeIds || !routeIds.length) return tripStatus_('route_missing');
+  if (routeIds.length === 1 && routeIds[0] === 'R01') {
+    return { success: true, status: 'approved', routeAssignmentPending: true, reply: TRIP_FUSEN_PENDING };
+  }
   if (routeIds.length > 1) return tripItineraryMultiple_(ss, access, routeIds);
   const routeId = routeIds[0];
-  const routes = tripTable_(ss, '旅遊路線', ['路線ID', '路線名稱', '交通方式', '開始日期', '結束日期']).rows
+  const routeTable = tripTable_(ss, '旅遊路線', ['路線ID', '路線名稱', '交通方式', '開始日期', '結束日期']);
+  const routes = routeTable.rows
     .filter(function (row) { return tripText_(row[0]) === routeId; });
   if (routes.length !== 1) return tripStatus_('route_missing');
   const events = tripTable_(ss, '每日行程', ['行程ID', '路線ID', '日期', '開始時間', '活動名稱', '集合地點', '公開狀態', '備註']).rows
@@ -333,14 +358,17 @@ function tripItinerary_(ss, lineUserId, name) {
   });
   const now = Date.now();
   const next = tripReminders_(ss).rows
-    .filter(function (row) { return tripText_(row[1]) === routeId && !['取消', '停用'].includes(tripText_(row[6])); })
+    .filter(function (row) { return tripReminderApplies_(row[1], routeId) && !['取消', '停用'].includes(tripText_(row[6])); })
     .map(function (row) { return { row: row, when: tripTaiwanTime_(row[2], row[3]) }; })
     .filter(function (item) { return item.when && item.when.ms > now && tripText_(item.row[4]); })
     .sort(function (a, b) { return a.when.ms - b.when.ms; })[0];
   if (next) reply += '\n\n下一次集合：' + next.when.date + ' ' + next.when.time +
     '\n集合地點：' + tripMessageText_(next.row[4], 200);
   if (reply.length > 4500) reply = reply.slice(0, 4400) + '\n其餘行程請洽旅遊承辦人。';
-  return tripAttachR02Morning_({ success: true, status: 'approved', reply: reply }, access, routeIds);
+  const result = { success: true, status: 'approved', reply: reply };
+  const image = tripRouteImage_(routeTable, routes[0], '行程圖片網址');
+  if (image) result.imageUrl = image;
+  return tripAttachR02Morning_(result, access, routeIds);
 }
 
 function tripItineraryMultiple_(ss, access, routeIds) {
@@ -350,8 +378,11 @@ function tripItineraryMultiple_(ss, access, routeIds) {
   const imageUrls = [], now = Date.now(), sections = [];
   for (let routeIndex = 0; routeIndex < routeIds.length; routeIndex++) {
     const routeId = routeIds[routeIndex];
+    if (routeId === 'R01') { sections.push(TRIP_FUSEN_PENDING); continue; }
     const routes = routeTable.rows.filter(function (row) { return tripText_(row[0]) === routeId; });
     if (routes.length !== 1) return tripStatus_('route_missing');
+    const routeImage = tripRouteImage_(routeTable, routes[0], '行程圖片網址');
+    if (routeImage && !imageUrls.includes(routeImage)) imageUrls.push(routeImage);
     const events = eventRows.filter(function (row) {
       return tripText_(row[1]) === routeId && ['', '公開'].includes(tripText_(row[6]));
     }).map(function (row) { return { row: row, when: tripTaiwanTime_(row[2], row[3]) }; });
@@ -368,10 +399,10 @@ function tripItineraryMultiple_(ss, access, routeIds) {
       if (tripText_(row[7])) section += '\n備註：' + tripMessageText_(row[7], 300);
       const match = tripText_(row[7]).match(/完整行程圖片[：:][ \t]*(https:\/\/[^\s]+)/iu);
       const url = match && match[1];
-      if (url && url.length <= 2000 && !imageUrls.includes(url)) imageUrls.push(url);
+      if (!routeImage && url && url.length <= 2000 && !imageUrls.includes(url)) imageUrls.push(url);
     });
     const next = reminderRows.filter(function (row) {
-      return tripText_(row[1]) === routeId && !['取消', '停用'].includes(tripText_(row[6]));
+      return tripReminderApplies_(row[1], routeId) && !['取消', '停用'].includes(tripText_(row[6]));
     }).map(function (row) { return { row: row, when: tripTaiwanTime_(row[2], row[3]) }; })
       .filter(function (item) { return item.when && item.when.ms > now && tripText_(item.row[4]); })
       .sort(function (a, b) { return a.when.ms - b.when.ms; })[0];
@@ -387,6 +418,10 @@ function tripItineraryMultiple_(ss, access, routeIds) {
   if (reply.length > 4500) reply = reply.slice(0, 4400) + '\n其餘行程請洽旅遊承辦人。';
   const result = { success: true, status: 'approved', reply: reply };
   if (imageUrls.length) result.imageUrls = imageUrls.slice(0, 5);
+  if (tripFusenPending_(routeIds)) {
+    result.routeAssignmentPending = true;
+    result.pendingRouteReply = TRIP_FUSEN_PENDING;
+  }
   return tripAttachR02Morning_(result, access, routeIds);
 }
 
@@ -483,6 +518,10 @@ function tripReminderRecipients_(ss) {
     routes.forEach(function (route) {
       if (!result[route]) result[route] = [];
       if (!result[route].includes(line)) result[route].push(line);
+      if (TRIP_FUSEN_ROUTES.includes(route)) {
+        if (!result.R01) result.R01 = [];
+        if (!result.R01.includes(line)) result.R01.push(line);
+      }
     });
   });
   Object.keys(result).forEach(function (route) { result[route].sort(); });
@@ -639,7 +678,10 @@ function tripAdminRoutes_(ss) {
   const table = tripTable_(ss, '旅遊路線', ['路線ID', '路線名稱', '交通方式', '開始日期', '結束日期']);
   const recipients = tripReminderRecipients_(ss), counts = Object.create(null);
   table.rows.forEach(function (r) { const id = tripText_(r[0]); if (id) counts[id] = (counts[id] || 0) + 1; });
-  return table.rows.filter(function (r) { return tripText_(r[0]) && counts[tripText_(r[0])] === 1; }).map(function (r) {
+  return table.rows.filter(function (r) {
+    const id = tripText_(r[0]);
+    return id && counts[id] === 1 && (!/^R01-/i.test(id) || TRIP_FUSEN_ROUTES.includes(id));
+  }).map(function (r) {
     const id = tripText_(r[0]);
     return { id: id, name: tripText_(r[1]) || id, recipientCount: (recipients[id] || []).length };
   });
@@ -674,9 +716,12 @@ function tripAdminSnapshot_(ss) {
 }
 
 function tripAdminPayload_(request) {
-  if (!Array.isArray(request.routeIds) || request.routeIds.length < 1 || request.routeIds.length > 2 ||
+  if (!Array.isArray(request.routeIds) || request.routeIds.length < 1 || request.routeIds.length > 4 ||
       request.routeIds.some(function (id) { return typeof id !== 'string' || !/^[A-Za-z0-9_.-]{1,40}$/.test(id); }) ||
       new Set(request.routeIds).size !== request.routeIds.length) return { error: 'invalid_route' };
+  if (request.routeIds.includes('R01') && request.routeIds.some(function (id) { return TRIP_FUSEN_ROUTES.includes(id); })) {
+    return { error: 'invalid_route' };
+  }
   if (typeof request.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(request.date) ||
       typeof request.time !== 'string' || !/^\d{2}:\d{2}$/.test(request.time)) return { error: 'invalid_time' };
   const when = tripTaiwanTime_(request.date, request.time);
@@ -1083,6 +1128,7 @@ function tripRosterHeaderType_(value) {
   if (['參加aorb', '參加方案', '參加行程', '方案', '路線', '路線id', 'route', 'routeid'].includes(key)) return 'route';
   if (['不參加', '未參加', '不報名'].includes(key)) return 'notParticipating';
   if (['眷屬', '家屬', 'dependent'].includes(key)) return 'dependent';
+  if (['福森號組合', '福森組合', '福森號行程組合', '福森號分組', '福森號路線', 'fusencombination', 'fusencombo'].includes(key)) return 'fusenCombo';
   if (['狀態', 'status'].includes(key)) return 'status';
   if (['車次', '班次', 'vehicle', 'coach'].includes(key)) return 'vehicle';
   if (['用餐座位', '用餐桌次', '桌次', '餐桌', 'diningseat', 'diningtable', 'mealseat'].includes(key)) return 'dining';
@@ -1095,7 +1141,7 @@ function tripRosterRoute_(value) {
   const text = tripText_(value).normalize('NFKC').toUpperCase();
   if (!text) return '';
   const rawParts = text.split(/[+、,，;；|／\/]+/).map(function (part) {
-    return part.replace(/[\s_\-.:：()（）]/g, '');
+    return part.replace(/[\s_.:：()（）]/g, '');
   }).filter(Boolean);
   const routes = [];
   for (let index = 0; index < rawParts.length; index++) {
@@ -1103,10 +1149,28 @@ function tripRosterRoute_(value) {
     let route = '';
     if (['A', 'A案', '方案A', 'R01'].includes(key)) route = 'R01';
     if (['B', 'B案', '方案B', 'R02'].includes(key)) route = 'R02';
+    const combo = key.replace(/^R01-?/, '');
+    if (['AC', 'BD'].includes(combo)) route = 'R01-' + combo;
     if (!route) return '';
     if (!routes.includes(route)) routes.push(route);
   }
-  return ['R01', 'R02'].filter(function (route) { return routes.includes(route); }).join(',');
+  if (routes.filter(function (route) { return route === 'R01' || TRIP_FUSEN_ROUTES.includes(route); }).length > 1) return '';
+  return ['R01'].concat(TRIP_FUSEN_ROUTES, ['R02']).filter(function (route) { return routes.includes(route); }).join(',');
+}
+
+function tripRosterFusenCombo_(value) {
+  const text = tripText_(value).normalize('NFKC').toUpperCase().replace(/\s+/g, '').replace(/^R01-?/, '');
+  if (!text) return '';
+  return ['AC', 'BD'].includes(text) ? text : null;
+}
+
+function tripRosterResolvedRoutes_(route, existingRoute) {
+  const routes = tripEmployeeRouteIds_(route), existing = tripEmployeeRouteIds_(existingRoute) || [];
+  const assigned = existing.filter(function (id) { return TRIP_FUSEN_ROUTES.includes(id); });
+  if (routes && routes.includes('R01') && assigned.length === 1) {
+    return routes.map(function (id) { return id === 'R01' ? assigned[0] : id; }).join(',');
+  }
+  return route;
 }
 
 function tripRosterTruthy_(value) {
@@ -1146,6 +1210,7 @@ function tripRosterMergeCandidates_(candidates, issues) {
   });
   Object.keys(groups).forEach(function (key) {
     const items = groups[key], routeIds = [], seenRoutes = Object.create(null);
+    if (outputIssues.some(function (issue) { return issue.participantKey && issue.participantKey === items[0].participantKey; })) return;
     let reason = '';
     items.forEach(function (item) {
       const routes = tripEmployeeRouteIds_(item.route) || [];
@@ -1155,11 +1220,12 @@ function tripRosterMergeCandidates_(candidates, issues) {
         if (!routeIds.includes(route)) routeIds.push(route);
       });
     });
-    const fields = ['status', 'room', 'vehicle', 'dining', 'department', 'morningChoice'];
+    const fields = ['status', 'room', 'vehicle', 'dining', 'department', 'morningChoice', 'fusenCombo'];
     const values = Object.create(null);
     fields.forEach(function (field) {
       const mergedValue = tripRosterMergeValue_(items, field);
-      if (mergedValue.conflict) reason = field === 'morningChoice' ? 'conflicting_morning_choice' : 'conflicting_file_data';
+      if (mergedValue.conflict) reason = field === 'morningChoice' ? 'conflicting_morning_choice' :
+        field === 'fusenCombo' ? 'conflicting_fusen_combo' : 'conflicting_file_data';
       values[field] = mergedValue.value || '';
     });
     const names = [];
@@ -1168,7 +1234,13 @@ function tripRosterMergeCandidates_(candidates, issues) {
       if (name && !names.includes(name)) names.push(name);
     });
     if (names.length !== 1) reason = 'conflicting_file_data';
-    const route = ['R01', 'R02'].filter(function (id) { return routeIds.includes(id); }).join(',');
+    const fusenRoutes = routeIds.filter(function (id) { return id === 'R01' || TRIP_FUSEN_ROUTES.includes(id); });
+    if (fusenRoutes.length > 1) reason = 'conflicting_fusen_combo';
+    if (values.fusenCombo && !fusenRoutes.length) reason = 'fusen_combo_not_applicable';
+    const assignedRoute = values.fusenCombo ? 'R01-' + values.fusenCombo : '';
+    if (assignedRoute && fusenRoutes.length === 1 && fusenRoutes[0] !== 'R01' && fusenRoutes[0] !== assignedRoute) reason = 'conflicting_fusen_combo';
+    const route = ['R01'].concat(TRIP_FUSEN_ROUTES, ['R02']).filter(function (id) { return routeIds.includes(id); })
+      .map(function (id) { return id === 'R01' && assignedRoute ? assignedRoute : id; }).join(',');
     if (values.morningChoice && !routeIds.includes('R02')) reason = 'morning_choice_not_applicable';
     if (reason) {
       outputIssues.push({ source: items.map(function (item) { return item.source; }).join('、'),
@@ -1197,7 +1269,7 @@ function tripRosterCandidatesFromTables_(tables) {
         if (type && columns[type] === undefined) columns[type] = column;
       });
       if (columns.id !== undefined && columns.name !== undefined && columns.route !== undefined) {
-        const score = 20 + ['department', 'notParticipating', 'dependent', 'status', 'room', 'vehicle', 'dining', 'morningChoice']
+        const score = 20 + ['department', 'notParticipating', 'dependent', 'status', 'room', 'vehicle', 'dining', 'morningChoice', 'fusenCombo']
           .filter(function (type) { return columns[type] !== undefined; }).length - rowIndex / 100;
         if (!best || score > best.score) best = { rowIndex: rowIndex, columns: columns, score: score };
       }
@@ -1227,8 +1299,11 @@ function tripRosterCandidatesFromTables_(tables) {
       if (!reason && status === null) reason = 'invalid_status';
       const morningChoice = columns.morningChoice === undefined ? '' : tripRosterMorningChoice_(row[columns.morningChoice]);
       if (!reason && morningChoice === null) reason = 'invalid_morning_choice';
+      const fusenCombo = columns.fusenCombo === undefined ? '' : tripRosterFusenCombo_(row[columns.fusenCombo]);
+      if (!reason && fusenCombo === null) reason = 'invalid_fusen_combo';
       if (reason) {
-        issues.push({ source: source, value: name || employeeId || tripText_(rawRoute), reason: reason });
+        issues.push({ source: source, value: name || employeeId || tripText_(rawRoute), reason: reason,
+          participantKey: dependent ? tripDependentKey_(name) : employeeId });
         continue;
       }
       candidates.push({ source: source, employeeId: dependent ? '' : employeeId,
@@ -1238,7 +1313,7 @@ function tripRosterCandidatesFromTables_(tables) {
         vehicle: columns.vehicle === undefined ? '' : tripRoomValue_(row[columns.vehicle]),
         dining: columns.dining === undefined ? '' : tripRoomValue_(row[columns.dining]),
         department: dependent || columns.department === undefined ? '' : tripRoomValue_(row[columns.department]),
-        morningChoice: morningChoice || '' });
+        morningChoice: morningChoice || '', fusenCombo: fusenCombo || '' });
       if (candidates.length > TRIP_ROOM_IMPORT_MAX_ASSIGNMENTS) throw new Error('Too many assignments');
     }
   });
@@ -1359,6 +1434,8 @@ function tripRosterIssueLines_(issues, limit) {
     duplicate_file_name: '檔案內姓名重複', ambiguous_employee: '資料庫員工編號重複',
     identity_mismatch: '姓名與員編不一致', name_exists_with_different_id: '姓名已屬於其他員編',
     protected_formula: '資料庫欄位為公式', duplicate_file_participant: '同一人同一路線重複',
+    invalid_fusen_combo: '福森號組合只能填 AC 或 BD', conflicting_fusen_combo: '同一人有不同的福森號組合',
+    fusen_combo_not_applicable: '福森號組合只適用福森號參加人員',
     conflicting_file_data: '同一人的資料互相衝突', invalid_morning_choice: '第二天上午只能填飯店設施或水蛙頭步道',
     morning_choice_not_applicable: '第二天上午選擇僅適用 R02', conflicting_morning_choice: '同一人有兩個不同的第二天上午選擇' };
   return issues.slice(0, limit).map(function (issue) {
@@ -1426,7 +1503,7 @@ function tripRosterPreview_(ss, ownerHash, parsed) {
       return;
     }
     const entry = existing[0], row = entry.row;
-    const fields = [tripText_(row[1]), candidate.route,
+    const fields = [tripText_(row[1]), tripRosterResolvedRoutes_(candidate.route, row[2]),
       candidate.dependent ? key : tripText_(row[3]), candidate.status || '啟用',
       candidate.room || tripText_(row[5]), candidate.vehicle || tripText_(row[6]),
       candidate.dining || tripText_(row[7]), candidate.dependent ? '' : (candidate.department || tripText_(row[8])),
@@ -1486,7 +1563,7 @@ function tripRosterConfirmSaved_(ss, saved, importId) {
     const morningChoice = tripR02MorningChoice_(fields[8]);
     if ((!employeeId && !dependent) || (employeeId && participantKey !== employeeId) ||
         (dependent && tripText_(fields[2]) !== participantKey) || !routeIds || !routeIds.length ||
-        routeIds.some(function (id) { return !['R01', 'R02'].includes(id); }) ||
+        routeIds.some(function (id) { return !['R01', 'R02'].concat(TRIP_FUSEN_ROUTES).includes(id); }) ||
         !['啟用', '停用'].includes(tripText_(fields[3])) || morningChoice === null ||
         (morningChoice && !routeIds.includes('R02'))) return tripStatus_('invalid_request');
     if (assignment.mode === 'update') {
@@ -1721,4 +1798,3 @@ function tripRoomAdmin_(ss, request) {
   if (!parsed.candidates.length && !(parsed.issues && parsed.issues.length)) return tripStatus_('no_rows');
   return tripRoomPreview_(ss, access.ownerHash, parsed);
 }
-

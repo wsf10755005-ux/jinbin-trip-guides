@@ -47,7 +47,9 @@
 
   function routes() {
     const selected = $('route').value;
-    return selected === 'ALL' ? state.routes : state.routes.filter(r => r.id === selected);
+    if (selected !== 'ALL') return state.routes.filter(r => r.id === selected);
+    const hasFusenAggregate = state.routes.some(r => r.id === 'R01');
+    return state.routes.filter(r => !hasFusenAggregate || !/^R01-(AC|BD)$/.test(r.id));
   }
 
   function formTime() {
@@ -75,7 +77,7 @@
     const selected = $('route').value;
     $('route').replaceChildren(new Option('請選擇路線', ''));
     for (const r of state.routes) $('route').append(new Option(`${r.id}｜${r.name}`, r.id));
-    if (state.routes.length > 1) $('route').append(new Option('兩個方案都通知', 'ALL'));
+    if (state.routes.length > 1) $('route').append(new Option('所有路線都通知', 'ALL'));
     $('route').value = selected;
     if (state.editing) { $('route').value = state.editing.routeId; const all = $('route').querySelector('[value="ALL"]'); if (all) all.disabled = true; }
     updateHints();
