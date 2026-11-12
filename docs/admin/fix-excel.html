@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="referrer" content="no-referrer">
+  <title>Excel 讀取修正｜金賓員工旅遊</title>
+  <link rel="stylesheet" href="admin.css?v=20261105">
+</head>
+<body>
+  <header class="topbar"><div><span class="brand">金賓員工旅遊</span><h1>Excel 讀取修正</h1></div></header>
+  <main>
+    <p>這次只需更新 Apps Script。修正讀取 .xlsx 時交給 Google 解壓縮的檔案類型，原始 Excel 不需要改名或轉檔。</p>
+    <section class="reminder-card">
+      <h2>更新 Apps Script</h2>
+      <button class="primary full" id="copy" disabled>正在載入完整程式…</button>
+      <a class="text-button" href="https://script.google.com/home/projects/1qenRhxJ6T2KAYu7RRbbrTSbJy2A8m78xTJFRMTqGVBomhTSyYdqd8OyM/edit" target="_blank" rel="noopener noreferrer">開啟原本的 Apps Script ↗</a>
+      <ol>
+        <li>按上方複製按鈕，在 Code.gs 全選後貼上，再儲存。</li>
+        <li>點「部署 → 管理部署作業」，選原本的網頁應用程式。</li>
+        <li>點編輯圖示，版本選「新版本」，再按部署。沿用原本 /exec 網址。</li>
+        <li>完成後重新傳送同一份 Excel，核對匯入預覽。按確認前不會寫入名單。</li>
+      </ol>
+      <p id="status" class="field-hint" role="status"></p>
+    </section>
+    <p class="notice">Cloudflare 這次不需要更新。原本的 API_SECRET、名單與綁定會沿用。</p>
+    <a class="text-button" href="../update-line/apps-script.txt?v=xlsx-zip-fix-20261112" download="AppsScript-Code.gs">下載完整 Apps Script 程式</a>
+  </main>
+  <script>
+  (() => {
+    const button = document.getElementById('copy'), status = document.getElementById('status');
+    let source = '';
+    fetch('../update-line/apps-script.txt?v=xlsx-zip-fix-20261112', { cache: 'no-store' })
+      .then(response => { if (!response.ok) throw Error(); return response.text(); })
+      .then(text => {
+        if (!text.includes('xlsx-zip-fix-20261112') || !text.includes('application/zip')) throw Error();
+        source = text; button.disabled = false; button.textContent = '複製完整 Apps Script 程式';
+        status.textContent = '版本：xlsx-zip-fix-20261112';
+      }).catch(() => { status.textContent = '程式載入失敗，請重新整理此頁。'; });
+    button.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(source); button.textContent = '✓ 已複製完整程式'; status.textContent = '請貼到原本的 Code.gs，儲存並部署新版本。'; }
+      catch {
+        let box = document.getElementById('source');
+        if (!box) { box = document.createElement('textarea'); box.id = 'source'; box.setAttribute('aria-label', '完整 Apps Script 程式'); box.style.width = '100%'; box.style.height = '220px'; button.after(box); }
+        box.value = source; box.focus(); box.select(); status.textContent = '請全選下方程式後手動複製。';
+      }
+    });
+  })();
+  </script>
+</body>
+</html>

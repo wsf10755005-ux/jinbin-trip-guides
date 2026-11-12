@@ -12,7 +12,7 @@
     } catch { status.textContent = '尚未確認到新版 Worker，請完成第 2 步後再試一次。'; }
     finally { check.disabled = false; }
   });
-  for (const [id, path, label] of [['copy-apps', '../update-line/apps-script.txt?v=dining-roster-20261112', 'Apps Script'], ['copy-worker', '../update-line/worker.txt?v=dining-roster-20261112', 'Worker']]) {
+  for (const [id, path, label] of [['copy-apps', '../update-line/apps-script.txt?v=xlsx-zip-fix-20261112', 'Apps Script'], ['copy-worker', '../update-line/worker.txt?v=dining-roster-20261112', 'Worker']]) {
     const button = document.getElementById(id); let source = '';
     fetch(path, { cache: 'no-store' }).then(r => { if (!r.ok) throw Error(); return r.text(); }).then(text => {
       if (!text.includes('adminReminders') && !text.includes('handleAdminRequest')) throw Error();

@@ -10,7 +10,7 @@ const TRIP_FUSEN_ROUTES = ['R01-AC', 'R01-BD'];
 const TRIP_FUSEN_PENDING = '福森號梯次尚未設定，請聯絡旅遊承辦人。';
 
 function doGet() {
-  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'dining-roster-20261112' });
+  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'xlsx-zip-fix-20261112' });
 }
 
 function doPost(e) {
@@ -1258,8 +1258,8 @@ function tripRoomWorkbookTables_(filename, bytes) {
   const zip = tripRoomZipSummary_(bytes);
   if (zip.error) return zip;
   let blobs;
-  try { blobs = Utilities.unzip(Utilities.newBlob(bytes,
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', filename)); }
+  // XLSX is a ZIP container. Give the unzip service a ZIP Blob explicitly.
+  try { blobs = Utilities.unzip(Utilities.newBlob(bytes, 'application/zip', 'workbook.zip')); }
   catch (ignored) { return { error: 'encrypted_or_invalid_file' }; }
   if (!Array.isArray(blobs) || !blobs.length || blobs.length > TRIP_ROOM_IMPORT_MAX_ENTRIES) {
     return { error: 'encrypted_or_invalid_file' };
