@@ -11,7 +11,7 @@ let localLinks = 0;
 for (const relative of pages) {
   const filename = path.join(root, 'docs', relative);
   const html = fs.readFileSync(filename, 'utf8');
-  assert.equal(/AD|BC|四種組合/.test(html), false, relative);
+  assert.equal(/AC|BD|AD|BC|四種組合/.test(html), false, relative);
   for (const match of html.matchAll(/(?:href|src)="([^"]+)"/g)) {
     const href = match[1];
     if (href.startsWith('#') || /^https?:/.test(href)) continue;
@@ -39,6 +39,7 @@ try {
   for (const [url, filename] of posters) {
     await page.goto(`${origin}/${url}`, { waitUntil: 'networkidle' });
     await page.evaluate(() => document.fonts.ready);
+    assert.equal(/AC|BD|AD|BC/.test(await page.locator('body').innerText()), false, `${url} has a public combination code`);
     assert.equal(await page.evaluate(() => [...document.images].every(image => image.complete && image.naturalWidth > 0)), true);
     const poster = page.locator('#poster');
     await poster.screenshot({ path: path.join(root, 'docs/assets', filename) });
@@ -53,9 +54,10 @@ try {
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `${width} ${route} overflow`);
       assert.equal(await page.locator('a[href*="/ad/"]').count(), 0);
       assert.equal(await page.locator('a[href*="/bc/"]').count(), 0);
+      assert.equal(/AC|BD|AD|BC/.test(await page.locator('body').innerText()), false, `${route} has a public combination code`);
       if (route !== 'r01/') {
-        const code = route.includes('/ac/') ? 'AC' : 'BD';
-        assert.ok((await page.locator('body').innerText()).includes(code));
+        const batch = route.includes('/ac/') ? '第1梯次' : '第2梯次';
+        assert.ok((await page.locator('body').innerText()).includes(batch));
         await page.locator('#sound-toggle').click();
         await page.waitForFunction(() => window.jinbinSound.enabled);
         assert.equal(await page.evaluate(() => window.jinbinSound.kind), 'r01');
@@ -66,6 +68,9 @@ try {
       }
       await page.evaluate(() => { document.activeElement?.blur(); scrollTo(0, 0); });
       await page.screenshot({ path: path.join(root, `../tmp/fusen-preview/${route.replaceAll('/', '-')}${width}.png`), fullPage: true });
+      if (route === 'r01/' && width === 390) {
+        await page.locator('#combinations').screenshot({ path: path.join(root, '../tmp/fusen-preview/batch-cards-mobile.png') });
+      }
     }
   }
   assert.deepEqual(errors, []);

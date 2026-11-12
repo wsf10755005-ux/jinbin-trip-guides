@@ -7,15 +7,15 @@
   <meta name="referrer" content="no-referrer">
   <title>系統更新｜金賓員工旅遊</title>
   <link rel="stylesheet" href="admin.css?v=20261105">
-  <script src="setup.js?v=fusen-two-batches-20261111" defer></script>
+  <script src="setup.js?v=dining-roster-20261112" defer></script>
 </head>
 <body>
-  <header class="topbar"><div><span class="brand">金賓員工旅遊</span><h1>福森號兩梯次更新</h1></div></header>
+  <header class="topbar"><div><span class="brand">金賓員工旅遊</span><h1>名單與桌次匯入更新</h1></div></header>
   <main>
-    <p>新版分為福森號第1梯次（AC）、第2梯次（BD）與台中南投（R02），依個人名單提供行程圖片、攻略、桌次與集合提醒。</p>
+    <p>參加方案可填中文行程名稱。A 方案是福森號，以梯次 1、2 區分；B 方案是台中南投。管理員可直接傳桌次 Excel，先選行程、核對預覽，再確認匯入。</p>
     <section class="reminder-card">
       <h2>1. 更新 Apps Script</h2>
-      <p class="field-hint">Excel 的「參加方案」填原本 A 或 B，另外新增「福森號組合」欄，填 AC（第1梯次）或 BD（第2梯次）。眷屬也用相同格式。</p>
+      <p class="field-hint">名單 Excel 的「參加方案」可填 A、B、A+B，另加「梯次」欄填 1 或 2；只參加台中南投時，梯次留空。也可在參加方案直接填「福森號第1梯次」「福森號第2梯次」或「台中南投」。</p>
       <button class="primary full" id="copy-apps" disabled>正在準備程式…</button>
       <a class="text-button" href="https://script.google.com/home/projects/1qenRhxJ6T2KAYu7RRbbrTSbJy2A8m78xTJFRMTqGVBomhTSyYdqd8OyM/edit" target="_blank" rel="noopener noreferrer">開啟原本的 Apps Script ↗</a>
       <ol>
@@ -35,7 +35,19 @@
     </section>
     <p id="setup-status" role="status" class="field-hint"></p>
     <a class="primary full" href="./">開啟手機管理頁 →</a>
-    <p class="notice">名單匯入先核對預覽，再按「確認匯入」。福森號組合空白時，LINE 會提示聯絡旅遊承辦人。管理頁可選「福森號全體」或指定組合發送提醒。</p>
+    <section class="reminder-card">
+      <h2>之後怎麼匯入桌次</h2>
+      <ol>
+        <li>在官方帳號一對一聊天室，直接傳旅行社的桌次 .xlsx 檔，不用先輸入「管理」。</li>
+        <li>第一列是桌號，例如 1-1、1-2；每欄下面放同桌姓名，左側人數序號會略過。</li>
+        <li>選擇福森號第1梯次、第2梯次或台中南投，核對人數、桌號、素食及未配對名單。</li>
+        <li>按「確認匯入」後，更新該行程整份桌次。其他行程的安排會保留。</li>
+      </ol>
+      <p>姓名文字或姓名格底色為綠色，會記為「素食」。桌次檔請保留 .xlsx；CSV 不會保留顏色。</p>
+      <p class="field-hint">請核對預覽中的素食名單。如果綠色是由「條件格式」自動顯示，請先改成姓名格固定的綠字或綠底再傳送。</p>
+      <p>員工點「桌次」，即可看到自己的桌號、同桌名單與本人素食標記。整個行程固定同一桌。</p>
+    </section>
+    <p class="notice">名單匯入先核對預覽，再按「確認匯入」。尚未分梯次的新福森號人員，LINE 會提示聯絡承辦人。眷屬欄填 1，員工編號、部門可留空，仍可輸入全名綁定。</p>
     <p class="notice">原本 ADMIN_PASSWORD、API_SECRET 和 LINE 密鑰會沿用。福森號兩梯次依旅行社參考行程整理，車票與集合時間以承辦人最終通知為準。</p>
   </main>
 </body>

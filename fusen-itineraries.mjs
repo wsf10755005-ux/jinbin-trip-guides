@@ -6,7 +6,7 @@ export const legs = {
 };
 
 export const fusenTrips = {
-  ac: { code: 'AC', batch: '第1梯次（AC）', routeId: 'R01-AC', title: '福森號・第1梯次（AC）', subtitle: '森好食上山・好森音下山',
+  ac: { code: 'AC', batchNumber: 1, batch: '第1梯次', routeId: 'R01-AC', title: '福森號・第1梯次', subtitle: '森好食上山・好森音下山',
     status: '依第 1 梯次參考行程整理', confirmed: true,
     notice: '原表註明元件尚未預定，高鐵依實際訂票確認。第二天早餐截止時間與 08:35 列車出發時間重疊，早餐及集合時間請等領隊確認。',
     source: '雄獅旅遊第 1 梯次參考行程',
@@ -32,7 +32,7 @@ export const fusenTrips = {
           ['17:19–18:25', '高鐵・嘉義 → 桃園', '建議時段，以實際票券為準，預計 19:30 返回集合地。']
         ] }
     ] },
-  bd: { code: 'BD', batch: '第2梯次（BD）', routeId: 'R01-BD', title: '福森號・第2梯次（BD）', subtitle: '森林癒上山・森品茗下山',
+  bd: { code: 'BD', batchNumber: 2, batch: '第2梯次', routeId: 'R01-BD', title: '福森號・第2梯次', subtitle: '森林癒上山・森品茗下山',
     status: '依第 2 梯次參考行程整理', confirmed: true,
     notice: '原表註明元件尚未預定，高鐵依實際訂票確認。第二天早餐與晨間活動有重疊，阿里山至奮起湖接駁及上車用餐時間待旅行社確認。',
     source: '雄獅旅遊第 2 梯次參考行程',

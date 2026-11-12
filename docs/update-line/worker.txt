@@ -5,7 +5,7 @@ const GUIDE_RICH_MENUS = {
   R02: 'richmenu-855706daa7c8f3e6862c3b7fad970bf3'
 };
 const FUSEN_ROUTES = new Set(['R01', 'R01-AC', 'R01-BD']);
-const FUSEN_ASSIGNMENT_PENDING = '福森號組合尚未設定，請聯絡旅遊承辦人。';
+const FUSEN_ASSIGNMENT_PENDING = '福森號梯次尚未設定，請聯絡旅遊承辦人。';
 const RETRY = '目前無法取得行程，請稍後再試。';
 const NAME_REQUIRED = '請先綁定帳號才能查詢喔～';
 const TRIP_UNAVAILABLE = '查無此人，請重新輸入';
@@ -185,19 +185,21 @@ async function roomLinePush(env, lineUserId, value) {
 
 function roomImportSummary(result, operation) {
   if (['forbidden', 'not_admin', 'unbound', 'disabled', 'pending'].includes(result.status)) return ROOM_ADMIN_ONLY;
-  if (result.kind === 'roster' && result.status === 'no_rows' && validText(result.summary) && result.summary.length <= 3800) {
+  if (result.status === 'choose_route') return diningImportRouteChoice(result, operation);
+  if (['roster', 'dining'].includes(result.kind) && result.status === 'no_rows' && validText(result.summary) && result.summary.length <= 3800) {
     return result.summary;
   }
-  const fileImport = operation === 'previewFile';
+  const fileImport = ['previewFile', 'selectDiningRoute'].includes(operation);
   const errors = {
     invalid_request: fileImport ? '資料格式不正確，請確認後重新傳送。' : '房號資料格式不正確，請確認後重新傳送。',
-    invalid_file: '無法辨識這份檔案，請確認檔案內有員工名單或房號資料。',
+    invalid_file: '無法辨識這份檔案，請確認檔案內有員工名單、房號或桌次資料。',
     unsupported_format: '請傳送 .xlsx 或 .csv 檔案；舊式 .xls 請先另存成 .xlsx。',
     encrypted_or_invalid_file: '無法開啟這份 Excel；若檔案有密碼，請先取消密碼後重新傳送。',
     file_too_large: '檔案內容過大，請只保留需要匯入的人員資料後重新傳送。',
-    columns_not_found: '找不到可辨識的員工名單或房號欄位，請確認表頭後重新傳送。',
+    columns_not_found: '找不到可辨識的員工名單、房號或桌次欄位，請確認表頭後重新傳送。',
     roster_columns_not_found: '找不到員工編號、姓名或方案欄位，請確認名單格式後重新傳送。',
-    invalid_route: '方案欄位只能填 A 或 B，請修正後重新傳送。',
+    invalid_route: '參加方案請填 A／B／A+B 或完整行程名稱；福森號請在「梯次」欄填 1 或 2。',
+    invalid_dining_route: '桌次表行程無法確認，請重新傳送，並選擇福森號第1梯次、第2梯次或台中南投。',
     duplicate_employee: '名單內有重複的員工編號，請修正後重新傳送。',
     invalid_text: '房號文字格式不正確，請依照範例重新傳送。',
     too_many_rows: '資料筆數過多，請分成兩次匯入。',
@@ -208,18 +210,18 @@ function roomImportSummary(result, operation) {
     busy: '系統忙碌中，請稍後再試。'
   };
   if (!['ok', 'preview'].includes(result.status)) return errors[result.status] ||
-    (fileImport ? '目前無法處理這份資料，請稍後再試。' : '目前無法處理房號資料，請稍後再試。');
+    (fileImport ? '目前無法處理這份資料，請稍後再試。' : '目前無法處理員工名單、房號或桌次資料，請稍後再試。');
   const text = result.kind === 'roster'
     ? rosterImportSummaryText(result, operation)
-    : result.summary;
+    : result.kind === 'dining' && operation === 'cancel' ? '已取消桌次匯入。' : result.summary;
   if (!validText(text) || text.length > 3800) {
     throw new EmployeeApiError('APPS_ROOM_SUMMARY_INVALID', { operation });
   }
-  if (!['previewFile', 'previewText'].includes(operation)) return text;
+  if (!['previewFile', 'previewText', 'selectDiningRoute'].includes(operation)) return text;
   if (typeof result.importId !== 'string' || !/^[A-Za-z0-9_-]{16,80}$/.test(result.importId)) {
     throw new EmployeeApiError('APPS_ROOM_IMPORT_ID_INVALID', { operation });
   }
-  const label = result.kind === 'roster' ? '員工名單' : result.kind === 'room' || operation === 'previewText' ? '房號' : '資料';
+  const label = result.kind === 'roster' ? '員工名單' : result.kind === 'dining' ? '桌次' : result.kind === 'room' || operation === 'previewText' ? '房號' : '資料';
   return {
     type: 'text',
     text,
@@ -231,6 +233,29 @@ function roomImportSummary(result, operation) {
           data: `room-import:cancel:${result.importId}`, displayText: `取消${label}匯入` } }
       ]
     }
+  };
+}
+
+function diningImportRouteChoice(result, operation) {
+  if (result.kind !== 'dining' || typeof result.importId !== 'string' ||
+      !/^[A-Za-z0-9_-]{16,80}$/.test(result.importId)) {
+    throw new EmployeeApiError('APPS_ROOM_IMPORT_ID_INVALID', { operation });
+  }
+  const labels = { 'R01-AC': '福森號第1梯次', 'R01-BD': '福森號第2梯次', 'R02': '台中南投' };
+  if (!Array.isArray(result.routes) || result.routes.length < 1 || result.routes.length > 3 ||
+      result.routes.some(route => !route || typeof route !== 'object' || Array.isArray(route) ||
+        typeof route.id !== 'string' || !Object.hasOwn(labels, route.id)) ||
+      new Set(result.routes.map(route => route.id)).size !== result.routes.length) {
+    throw new EmployeeApiError('APPS_DINING_ROUTES_INVALID', { operation });
+  }
+  return {
+    type: 'text', text: '請選擇這份桌次表適用的行程，選好後會先產生匯入預覽。',
+    quickReply: { items: [
+      ...result.routes.map(route => ({ type: 'action', action: { type: 'postback', label: labels[route.id],
+        data: `dining-import:route:${result.importId}:${route.id}`, displayText: `桌次表行程：${labels[route.id]}` } })),
+      { type: 'action', action: { type: 'postback', label: '取消',
+        data: `room-import:cancel:${result.importId}`, displayText: '取消桌次匯入' } }
+    ] }
   };
 }
 
@@ -458,6 +483,13 @@ async function appsScript(env, action, fields, deadline) {
 }
 
 async function buildReply(message, lineUserId, env, deadline) {
+  const diningRoute = message.match(/^dining-import:route:([A-Za-z0-9_-]{16,80}):(R01-AC|R01-BD|R02)$/);
+  if (diningRoute) {
+    const result = await appsScript(env, 'roomAdmin', { operation: 'selectDiningRoute', lineUserId,
+      importId: diningRoute[1], routeId: diningRoute[2] }, deadline);
+    return roomImportSummary(result, 'selectDiningRoute');
+  }
+  if (message.startsWith('dining-import:')) return '桌次匯入操作無效，請重新傳送檔案。';
   const importAction = message.match(/^room-import:(confirm|cancel):([A-Za-z0-9_-]{16,80})$/);
   if (importAction) {
     const operation = importAction[1];
@@ -478,7 +510,14 @@ async function buildReply(message, lineUserId, env, deadline) {
   if (result.status === 'approved') {
     const morningMessage = topic === '行程' ? r02MorningMessage(result) : null;
     const pendingMessage = topic && result.routeAssignmentPending === true ? FUSEN_ASSIGNMENT_PENDING : null;
-    const notices = [morningMessage, pendingMessage].filter(Boolean);
+    let diningMessage = null;
+    if (topic === '桌次' && Object.hasOwn(result, 'diningReply')) {
+      if (!validText(result.diningReply) || result.diningReply.length > 3800) {
+        throw new EmployeeApiError('APPS_DINING_REPLY_INVALID');
+      }
+      diningMessage = result.diningReply;
+    }
+    const notices = [morningMessage, pendingMessage, diningMessage].filter(Boolean);
     let usedItineraryFallback = false;
     let imageUrls = topic === '桌次'
       ? result.imageUrls !== undefined ? result.imageUrls : result.imageUrl !== undefined ? [result.imageUrl] : undefined
@@ -640,7 +679,7 @@ async function handleAdminRequest(request, env) {
   if (request.method === 'OPTIONS') return adminResponse(null, 204);
   const path = new URL(request.url).pathname;
   if (path === '/admin/health' && request.method === 'GET') {
-    return adminResponse({ service: 'employee-trip', build: 'fusen-two-batches-20261111',
+    return adminResponse({ service: 'employee-trip', build: 'dining-roster-20261112',
       adminConfigured: typeof env.ADMIN_PASSWORD === 'string' && env.ADMIN_PASSWORD.trim().length >= 12 });
   }
   if (!['/admin/login', '/admin/reminders'].includes(path)) return adminResponse({ error: '找不到此功能。' }, 404);

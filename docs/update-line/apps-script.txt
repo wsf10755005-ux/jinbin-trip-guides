@@ -7,10 +7,10 @@ const TRIP_DEPENDENT_KEY_PREFIX = 'DEP-';
 const TRIP_R02_MORNING_HEADER = '第二天上午選擇';
 const TRIP_R02_MORNING_CHOICES = ['飯店設施', '水蛙頭步道'];
 const TRIP_FUSEN_ROUTES = ['R01-AC', 'R01-BD'];
-const TRIP_FUSEN_PENDING = '福森號組合尚未設定，請聯絡旅遊承辦人。';
+const TRIP_FUSEN_PENDING = '福森號梯次尚未設定，請聯絡旅遊承辦人。';
 
 function doGet() {
-  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'fusen-two-batches-20261111' });
+  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'dining-roster-20261112' });
 }
 
 function doPost(e) {
@@ -124,6 +124,13 @@ function tripEmployeeRouteValue_(value) {
   return routeIds && routeIds.length ? routeIds.join(',') : '';
 }
 
+function tripRouteLabel_(value) {
+  const names = { R01: '福森號（梯次待安排）', 'R01-AC': '福森號第1梯次',
+    'R01-BD': '福森號第2梯次', R02: '台中南投' };
+  const routes = tripEmployeeRouteIds_(value);
+  return routes && routes.length ? routes.map(function (id) { return names[id] || '行程'; }).join('、') : '行程';
+}
+
 function tripEmployeeId_(value) {
   const id = tripText_(value).normalize('NFKC');
   return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(id) ? id : '';
@@ -191,9 +198,19 @@ function tripPortal_(ss, body) {
       const url = index >= 0 ? tripText_(routes[0][index]) : '';
       if (url && /^https:\/\/[^\s]+$/i.test(url) && url.length <= 2000) urls.push(url);
     }
-    if (urls.length === 1) return { success: true, status: 'approved', imageUrl: urls[0] };
-    if (urls.length > 1) return { success: true, status: 'approved', imageUrls: urls };
-    reply = tripFusenPending_(routeIds) || '桌次圖片尚未公布。';
+    const diningReply = tripDiningReply_(ss, access, routeIds);
+    if (urls.length === 1) {
+      const result = { success: true, status: 'approved', imageUrl: urls[0] };
+      if (diningReply) result.diningReply = diningReply;
+      return result;
+    }
+    if (urls.length > 1) {
+      const result = { success: true, status: 'approved', imageUrls: urls };
+      if (diningReply) result.diningReply = diningReply;
+      return result;
+    }
+    reply = diningReply || tripFusenPending_(routeIds) || '桌次圖片尚未公布。';
+    if (diningReply) return { success: true, status: 'approved', reply: reply, diningReply: diningReply };
   }
   if (body.topic === '旅遊攻略') {
     if (!routeIds || !routeIds.length) return tripStatus_('route_missing');
@@ -201,7 +218,7 @@ function tripPortal_(ss, body) {
       return tripText_(row[0]) !== 'R01' && routeIds.includes(tripText_(row[0])) && ['', '公開'].includes(tripText_(row[3]));
     });
     reply = rows.length ? '旅遊攻略\n' + rows.map(function (row) {
-      const routeLabel = routeIds.length > 1 ? '【' + tripMessageText_(row[0], 40) + '】' : '';
+      const routeLabel = routeIds.length > 1 ? '【' + tripRouteLabel_(tripText_(row[0])) + '】' : '';
       return routeLabel + tripMessageText_(row[1], 150) + '\n' + tripText_(row[2]).slice(0, 2000);
     }).join('\n\n') : '旅遊攻略尚未公布。';
     if (tripFusenPending_(routeIds)) reply = tripFusenPending_(routeIds) + (rows.length ? '\n\n' + reply : '');
@@ -877,7 +894,7 @@ function tripRoomCacheRead_(importId, ownerHash) {
   if (!saved || ![1, 2].includes(saved.version) || saved.ownerHash !== ownerHash || !Array.isArray(saved.assignments) ||
       !Number.isFinite(saved.expiresAt) || saved.expiresAt <= Date.now()) return null;
   if (saved.version === 1 && !saved.kind) saved.kind = 'room';
-  if (!['room', 'roster'].includes(saved.kind)) return null;
+  if (!['room', 'roster', 'dining'].includes(saved.kind)) return null;
   return saved;
 }
 
@@ -936,14 +953,163 @@ function tripRoomSharedStrings_(xml) {
   return strings;
 }
 
-function tripRoomWorksheetRows_(xml, sharedStrings) {
-  const rows = [], rowExpression = /<row\b([^>]*)>([\s\S]*?)<\/row>/gi;
+function tripRoomXmlAttribute_(attributes, name) {
+  const match = String(attributes || '').match(new RegExp('(?:^|\\s)' + name + '\\s*=\\s*(["\\\'])(.*?)\\1', 'i'));
+  return match ? tripRoomXmlDecode_(match[2]) : '';
+}
+
+function tripRoomXmlElements_(xml, tag) {
+  const prefix = '(?:[A-Za-z_][\\w.-]*:)?';
+  const expression = new RegExp('<' + prefix + tag + '\\b([^>]*?)(?:\\/\\s*>|>([\\s\\S]*?)<\\/' + prefix + tag + '\\s*>)', 'gi');
+  const result = [];
+  let match;
+  while ((match = expression.exec(String(xml || ''))) !== null) {
+    if (result.length >= TRIP_ROOM_IMPORT_MAX_CELLS) throw new Error('Workbook too large');
+    result.push({ attributes: match[1] || '', body: match[2] || '' });
+  }
+  return result;
+}
+
+function tripRoomColorRgb_(hex) {
+  const text = String(hex || '').replace(/^#/, '');
+  if (!/^(?:[0-9a-f]{6}|[0-9a-f]{8})$/i.test(text)) return null;
+  const rgb = text.slice(-6);
+  return [parseInt(rgb.slice(0, 2), 16), parseInt(rgb.slice(2, 4), 16), parseInt(rgb.slice(4, 6), 16)];
+}
+
+function tripRoomColorTint_(rgb, tint) {
+  if (!tint) return rgb;
+  const channels = rgb.map(function (v) { return v / 255; });
+  const maximum = Math.max.apply(null, channels), minimum = Math.min.apply(null, channels);
+  const delta = maximum - minimum, lightness = (maximum + minimum) / 2;
+  const saturation = delta ? delta / (1 - Math.abs(2 * lightness - 1)) : 0;
+  let hue = 0;
+  if (delta) {
+    if (maximum === channels[0]) hue = ((channels[1] - channels[2]) / delta + 6) % 6;
+    else if (maximum === channels[1]) hue = (channels[2] - channels[0]) / delta + 2;
+    else hue = (channels[0] - channels[1]) / delta + 4;
+  }
+  const adjusted = tint < 0 ? lightness * (1 + tint) : lightness * (1 - tint) + tint;
+  const chroma = (1 - Math.abs(2 * adjusted - 1)) * saturation;
+  const x = chroma * (1 - Math.abs(hue % 2 - 1)), offset = adjusted - chroma / 2;
+  const sectors = [[chroma, x, 0], [x, chroma, 0], [0, chroma, x], [0, x, chroma], [x, 0, chroma], [chroma, 0, x]];
+  return sectors[Math.floor(hue) % 6].map(function (v) { return Math.max(0, Math.min(255, Math.round((v + offset) * 255))); });
+}
+
+function tripRoomThemeColors_(xml) {
+  const scheme = tripRoomXmlElements_(xml, 'clrScheme')[0];
+  if (!scheme) return [];
+  // Spreadsheet theme keys swap the first light/dark pairs from XML order.
+  return ['lt1', 'dk1', 'lt2', 'dk2', 'accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6', 'hlink', 'folHlink']
+    .map(function (name) {
+      const slot = tripRoomXmlElements_(scheme.body, name)[0];
+      if (!slot) return null;
+      const srgb = tripRoomXmlElements_(slot.body, 'srgbClr')[0];
+      const system = tripRoomXmlElements_(slot.body, 'sysClr')[0];
+      return tripRoomColorRgb_(srgb ? tripRoomXmlAttribute_(srgb.attributes, 'val') :
+        system ? tripRoomXmlAttribute_(system.attributes, 'lastClr') : '');
+    });
+}
+
+function tripRoomColorEnvironment_(stylesXml, themeXml) {
+  const defaultPalette = ('000000 FFFFFF FF0000 00FF00 0000FF FFFF00 FF00FF 00FFFF ' +
+    '000000 FFFFFF FF0000 00FF00 0000FF FFFF00 FF00FF 00FFFF ' +
+    '800000 008000 000080 808000 800080 008080 C0C0C0 808080 ' +
+    '9999FF 993366 FFFFCC CCFFFF 660066 FF8080 0066CC CCCCFF ' +
+    '000080 FF00FF FFFF00 00FFFF 800080 800000 008080 0000FF ' +
+    '00CCFF CCFFFF CCFFCC FFFF99 99CCFF FF99CC CC99FF FFCC99 ' +
+    '3366FF 33CCCC 99CC00 FFCC00 FF9900 FF6600 666699 969696 ' +
+    '003366 339966 003300 333300 993300 993366 333399 333333').split(' ').map(tripRoomColorRgb_);
+  const indexed = tripRoomXmlElements_(stylesXml, 'indexedColors')[0];
+  const palette = indexed ? tripRoomXmlElements_(indexed.body, 'rgbColor').map(function (color) {
+    return tripRoomColorRgb_(tripRoomXmlAttribute_(color.attributes, 'rgb'));
+  }) : defaultPalette;
+  return { theme: tripRoomThemeColors_(themeXml), indexed: palette };
+}
+
+function tripRoomColorValue_(attributes, environment) {
+  if (/^(?:1|true)$/i.test(tripRoomXmlAttribute_(attributes, 'auto'))) return null;
+  const rgb = tripRoomXmlAttribute_(attributes, 'rgb'), indexed = tripRoomXmlAttribute_(attributes, 'indexed');
+  const theme = tripRoomXmlAttribute_(attributes, 'theme');
+  let color = rgb ? tripRoomColorRgb_(rgb) : null;
+  if (!color && /^\d+$/.test(indexed)) color = environment.indexed[Number(indexed)] || null;
+  if (!color && /^\d+$/.test(theme)) color = environment.theme[Number(theme)] || null;
+  if (!color) return null;
+  const rawTint = tripRoomXmlAttribute_(attributes, 'tint'), tint = rawTint ? Number(rawTint) : 0;
+  if (!Number.isFinite(tint) || tint < -1 || tint > 1) return null;
+  return tripRoomColorTint_(color, tint);
+}
+
+function tripRoomColorVegetarian_(attributes, environment) {
+  const rgb = tripRoomColorValue_(attributes, environment);
+  return !!rgb && rgb[1] >= rgb[0] + 8 && rgb[1] >= rgb[2] + 8 && Math.max.apply(null, rgb) - Math.min.apply(null, rgb) >= 16;
+}
+
+function tripRoomWorkbookStyles_(stylesXml, themeXml) {
+  const environment = tripRoomColorEnvironment_(stylesXml, themeXml);
+  const fontsElement = tripRoomXmlElements_(stylesXml, 'fonts')[0];
+  const fillsElement = tripRoomXmlElements_(stylesXml, 'fills')[0];
+  const fonts = tripRoomXmlElements_(fontsElement ? fontsElement.body : '', 'font').map(function (font) {
+    const color = tripRoomXmlElements_(font.body, 'color')[0];
+    return !!color && tripRoomColorVegetarian_(color.attributes, environment);
+  });
+  const fills = tripRoomXmlElements_(fillsElement ? fillsElement.body : '', 'fill').map(function (fill) {
+    const pattern = tripRoomXmlElements_(fill.body, 'patternFill')[0];
+    if (!pattern || tripRoomXmlAttribute_(pattern.attributes, 'patternType').toLowerCase() !== 'solid') return false;
+    const color = tripRoomXmlElements_(pattern.body, 'fgColor')[0];
+    return !!color && tripRoomColorVegetarian_(color.attributes, environment);
+  });
+  const baseElement = tripRoomXmlElements_(stylesXml, 'cellStyleXfs')[0];
+  const bases = tripRoomXmlElements_(baseElement ? baseElement.body : '', 'xf');
+  const stylesElement = tripRoomXmlElements_(stylesXml, 'cellXfs')[0];
+  const styles = tripRoomXmlElements_(stylesElement ? stylesElement.body : '', 'xf').map(function (style) {
+    const baseIndex = tripRoomXmlAttribute_(style.attributes, 'xfId');
+    const base = /^\d+$/.test(baseIndex) ? bases[Number(baseIndex)] : null;
+    function id(name, apply) {
+      const own = tripRoomXmlAttribute_(style.attributes, name);
+      const inherit = base && (own === '' || /^(?:0|false)$/i.test(tripRoomXmlAttribute_(style.attributes, apply)));
+      const value = inherit ? tripRoomXmlAttribute_(base.attributes, name) : own;
+      return /^\d+$/.test(value) ? Number(value) : 0;
+    }
+    return { fontVegetarian: fonts[id('fontId', 'applyFont')] === true, fillVegetarian: fills[id('fillId', 'applyFill')] === true };
+  });
+  return { colors: environment, styles: styles };
+}
+
+function tripRoomRichTextVegetarian_(xml, environment, baseFont) {
+  const runs = tripRoomXmlElements_(xml, 'r');
+  if (!runs.length) return !!baseFont;
+  return runs.some(function (run) {
+    if (!tripRoomXmlRuns_(run.body).trim()) return false;
+    const properties = tripRoomXmlElements_(run.body, 'rPr')[0];
+    const color = properties && tripRoomXmlElements_(properties.body, 'color')[0];
+    return color ? tripRoomColorVegetarian_(color.attributes, environment) : !!baseFont;
+  });
+}
+
+function tripDiningCellVegetarian_(rows, row, column) {
+  return !!(rows && rows.cellStyles && rows.cellStyles[row + ',' + column] && rows.cellStyles[row + ',' + column].vegetarian === true);
+}
+
+function tripRoomWorksheetRows_(xml, sharedStrings, workbookStyles) {
+  const rows = [], cellStyles = Object.create(null), rowExpression = /<row\b([^>]*)>([\s\S]*?)<\/row>/gi;
+  const columnStyles = Object.create(null);
+  if (workbookStyles) tripRoomXmlElements_(xml, 'col').forEach(function (column) {
+    const min = Number(tripRoomXmlAttribute_(column.attributes, 'min'));
+    const max = Number(tripRoomXmlAttribute_(column.attributes, 'max'));
+    const style = tripRoomXmlAttribute_(column.attributes, 'style');
+    if (!Number.isInteger(min) || !Number.isInteger(max) || min < 1 || max < min || !/^\d+$/.test(style)) return;
+    for (let index = min - 1; index < Math.min(max, TRIP_ROOM_IMPORT_MAX_COLUMNS); index++) columnStyles[index] = Number(style);
+  });
   let rowMatch, populated = 0;
   while ((rowMatch = rowExpression.exec(xml)) !== null) {
     const rowAttribute = rowMatch[1].match(/\br="(\d+)"/i);
     const rowIndex = rowAttribute ? Number(rowAttribute[1]) - 1 : rows.length;
     if (!Number.isInteger(rowIndex) || rowIndex < 0 || rowIndex >= TRIP_ROOM_IMPORT_MAX_ROWS) throw new Error('Workbook too large');
     if (!rows[rowIndex]) rows[rowIndex] = [];
+    const rowStyle = tripRoomXmlAttribute_(rowMatch[1], 's');
+    const customRowStyle = /^(?:1|true)$/i.test(tripRoomXmlAttribute_(rowMatch[1], 'customFormat')) && /^\d+$/.test(rowStyle)
+      ? Number(rowStyle) : null;
     const cellExpression = /<c\b([^>]*?)(?:\/\s*>|>([\s\S]*?)<\/c>)/gi;
     let cellMatch;
     while ((cellMatch = cellExpression.exec(rowMatch[2])) !== null) {
@@ -955,13 +1121,22 @@ function tripRoomWorksheetRows_(xml, sharedStrings) {
       const body = cellMatch[2] || '';
       const type = (cellMatch[1].match(/\bt="([^"]+)"/i) || [])[1] || '';
       const raw = (body.match(/<v(?:\s[^>]*)?>([\s\S]*?)<\/v>/i) || [])[1];
-      let value = '';
-      if (type === 'inlineStr') value = tripRoomXmlRuns_(body);
+      let value = '', rich = '';
+      if (type === 'inlineStr') { value = tripRoomXmlRuns_(body); rich = body; }
       else if (type === 's') {
         const index = Number(tripRoomXmlDecode_(raw));
         value = Number.isInteger(index) && index >= 0 && index < sharedStrings.length ? sharedStrings[index] : '';
+        rich = sharedStrings.richText && sharedStrings.richText[index] || '';
       } else if (raw !== undefined) value = tripRoomXmlDecode_(raw.replace(/<[^>]*>/g, ''));
       rows[rowIndex][column] = String(value || '').slice(0, 500);
+      if (value && workbookStyles) {
+        const styleId = tripRoomXmlAttribute_(cellMatch[1], 's');
+        const index = /^\d+$/.test(styleId) ? Number(styleId) : customRowStyle !== null ? customRowStyle : columnStyles[column] || 0;
+        const style = workbookStyles.styles[index] || workbookStyles.styles[0] || {};
+        if (style.fillVegetarian || tripRoomRichTextVegetarian_(rich, workbookStyles.colors, style.fontVegetarian)) {
+          cellStyles[rowIndex + ',' + column] = { vegetarian: true };
+        }
+      }
     }
   }
   const mergeExpression = /<mergeCell\b[^>]*\bref="([^"]+)"[^>]*\/?\s*>/gi;
@@ -976,11 +1151,16 @@ function tripRoomWorksheetRows_(xml, sharedStrings) {
     for (let row = start.row; row <= end.row; row++) {
       if (!rows[row]) rows[row] = [];
       for (let column = start.column; column <= end.column; column++) {
-        if (rows[row][column] === undefined || rows[row][column] === '') rows[row][column] = value;
+        if (rows[row][column] === undefined || rows[row][column] === '') {
+          rows[row][column] = value;
+          if (cellStyles[start.row + ',' + start.column]) cellStyles[row + ',' + column] = { vegetarian: true };
+        }
       }
     }
   }
-  return rows.map(function (row) { return row || []; });
+  const result = rows.map(function (row) { return row || []; });
+  if (Object.keys(cellStyles).length) result.cellStyles = cellStyles;
+  return result;
 }
 
 function tripRoomCsvRows_(text) {
@@ -1092,16 +1272,18 @@ function tripRoomWorkbookTables_(filename, bytes) {
     totalBytes += entryBytes.length;
     if (totalBytes > TRIP_ROOM_IMPORT_MAX_UNZIPPED_BYTES) return { error: 'file_too_large' };
     if (/^(EncryptionInfo|EncryptedPackage)$/i.test(name)) return { error: 'encrypted_or_invalid_file' };
-    if (/^(xl\/sharedStrings\.xml|xl\/worksheets\/[^/]+\.xml)$/i.test(name)) {
+    if (/^(xl\/sharedStrings\.xml|xl\/styles\.xml|xl\/theme\/theme1\.xml|xl\/worksheets\/[^/]+\.xml)$/i.test(name)) {
       entries[name.toLowerCase()] = blobs[i].getDataAsString('UTF-8');
     }
   }
   const shared = tripRoomSharedStrings_(entries['xl/sharedstrings.xml'] || '');
+  shared.richText = tripRoomXmlElements_(entries['xl/sharedstrings.xml'] || '', 'si').map(function (string) { return string.body; });
+  const styles = tripRoomWorkbookStyles_(entries['xl/styles.xml'] || '', entries['xl/theme/theme1.xml'] || '');
   const sheetNames = Object.keys(entries).filter(function (name) {
     return /^xl\/worksheets\/[^/]+\.xml$/i.test(name);
   }).sort().slice(0, TRIP_ROOM_IMPORT_MAX_SHEETS);
   if (!sheetNames.length) return { error: 'encrypted_or_invalid_file' };
-  return { tables: sheetNames.map(function (name) { return tripRoomWorksheetRows_(entries[name], shared); }) };
+  return { tables: sheetNames.map(function (name) { return tripRoomWorksheetRows_(entries[name], shared, styles); }) };
 }
 
 function tripRoomHeaderKey_(value) {
@@ -1128,13 +1310,24 @@ function tripRosterHeaderType_(value) {
   if (['參加aorb', '參加方案', '參加行程', '方案', '路線', '路線id', 'route', 'routeid'].includes(key)) return 'route';
   if (['不參加', '未參加', '不報名'].includes(key)) return 'notParticipating';
   if (['眷屬', '家屬', 'dependent'].includes(key)) return 'dependent';
-  if (['福森號組合', '福森組合', '福森號行程組合', '福森號分組', '福森號路線', 'fusencombination', 'fusencombo'].includes(key)) return 'fusenCombo';
+  if (['梯次', '福森號梯次', '福勝號梯次', '福森梯次', '福森號組合', '福森組合', '福森號行程組合', '福森號分組', '福森號路線', 'fusencombination', 'fusencombo'].includes(key)) return 'fusenCombo';
   if (['狀態', 'status'].includes(key)) return 'status';
   if (['車次', '班次', 'vehicle', 'coach'].includes(key)) return 'vehicle';
   if (['用餐座位', '用餐桌次', '桌次', '餐桌', 'diningseat', 'diningtable', 'mealseat'].includes(key)) return 'dining';
   if (['第二天上午選擇', '第二天上午行程', '第二天1000前選擇', '第二天10點前選擇',
       '1000前選擇', '10點前選擇', '上午行程選擇', '晨間選擇'].includes(key)) return 'morningChoice';
   return '';
+}
+
+function tripRosterNamedRoute_(key) {
+  if (['台中南投', '南投台中', '台中南投三天兩夜'].includes(key)) return 'R02';
+  const match = key.match(/^福(?:森|勝)號(?:(AC|BD|A|B))?(?:第([一二12])梯次|梯次([12]))?$/);
+  if (!match) return '';
+  const code = match[1] ? (['A', 'AC'].includes(match[1]) ? 'AC' : 'BD') : '';
+  const batchNumber = match[2] || match[3];
+  const batch = batchNumber ? (['一', '1'].includes(batchNumber) ? 'AC' : 'BD') : '';
+  if (code && batch && code !== batch) return '';
+  return code || batch ? 'R01-' + (code || batch) : 'R01';
 }
 
 function tripRosterRoute_(value) {
@@ -1151,6 +1344,7 @@ function tripRosterRoute_(value) {
     if (['B', 'B案', '方案B', 'R02'].includes(key)) route = 'R02';
     const combo = key.replace(/^R01-?/, '');
     if (['AC', 'BD'].includes(combo)) route = 'R01-' + combo;
+    if (!route) route = tripRosterNamedRoute_(key);
     if (!route) return '';
     if (!routes.includes(route)) routes.push(route);
   }
@@ -1159,9 +1353,13 @@ function tripRosterRoute_(value) {
 }
 
 function tripRosterFusenCombo_(value) {
-  const text = tripText_(value).normalize('NFKC').toUpperCase().replace(/\s+/g, '').replace(/^R01-?/, '');
+  const text = tripText_(value).normalize('NFKC').toUpperCase().replace(/[\s_.:：()（）]/g, '').replace(/^R01-?/, '');
   if (!text) return '';
-  return ['AC', 'BD'].includes(text) ? text : null;
+  if (['1', '梯次1', '第1梯次', '第一梯次'].includes(text)) return 'AC';
+  if (['2', '梯次2', '第2梯次', '第二梯次'].includes(text)) return 'BD';
+  if (['AC', 'BD'].includes(text)) return text;
+  const route = tripRosterNamedRoute_(text);
+  return TRIP_FUSEN_ROUTES.includes(route) ? route.slice(4) : null;
 }
 
 function tripRosterResolvedRoutes_(route, existingRoute) {
@@ -1429,13 +1627,13 @@ function tripRosterEmployeeRevision_(row, formulas) {
 }
 
 function tripRosterIssueLines_(issues, limit) {
-  const labels = { missing_employee_id: '缺少員工編號', invalid_employee_id: '員工編號格式錯誤', missing_name: '缺少姓名', missing_route: '未選 A 或 B',
-    invalid_route: '方案不是 A 或 B', invalid_status: '狀態只能是啟用或停用', duplicate_file_id: '檔案內員工編號重複',
+  const labels = { missing_employee_id: '缺少員工編號', invalid_employee_id: '員工編號格式錯誤', missing_name: '缺少姓名', missing_route: '未填參加方案',
+    invalid_route: '無法辨識參加方案，請填A、B或完整行程名稱', invalid_status: '狀態只能是啟用或停用', duplicate_file_id: '檔案內員工編號重複',
     duplicate_file_name: '檔案內姓名重複', ambiguous_employee: '資料庫員工編號重複',
     identity_mismatch: '姓名與員編不一致', name_exists_with_different_id: '姓名已屬於其他員編',
     protected_formula: '資料庫欄位為公式', duplicate_file_participant: '同一人同一路線重複',
-    invalid_fusen_combo: '福森號組合只能填 AC 或 BD', conflicting_fusen_combo: '同一人有不同的福森號組合',
-    fusen_combo_not_applicable: '福森號組合只適用福森號參加人員',
+    invalid_fusen_combo: '梯次只能填1或2', conflicting_fusen_combo: '同一人有不同的福森號梯次',
+    fusen_combo_not_applicable: '梯次僅適用福森號',
     conflicting_file_data: '同一人的資料互相衝突', invalid_morning_choice: '第二天上午只能填飯店設施或水蛙頭步道',
     morning_choice_not_applicable: '第二天上午選擇僅適用 R02', conflicting_morning_choice: '同一人有兩個不同的第二天上午選擇' };
   return issues.slice(0, limit).map(function (issue) {
@@ -1499,7 +1697,7 @@ function tripRosterPreview_(ss, ownerHash, parsed) {
       assignments.push({ mode: 'new', rowNumber: 0, employeeId: candidate.employeeId || '', participantKey: key,
         revision: '', fields: fields });
       newCount++;
-      if (samples.length < 8) samples.push('新增 ' + (candidate.employeeId || '眷屬') + ' ' + candidate.name + ' → ' + candidate.route);
+      if (samples.length < 8) samples.push('新增 ' + (candidate.employeeId || '眷屬') + ' ' + candidate.name + ' → ' + tripRouteLabel_(candidate.route));
       return;
     }
     const entry = existing[0], row = entry.row;
@@ -1525,7 +1723,7 @@ function tripRosterPreview_(ss, ownerHash, parsed) {
     assignments.push({ mode: 'update', rowNumber: entry.rowNumber, employeeId: candidate.employeeId || '', participantKey: key,
       revision: tripRosterEmployeeRevision_(row, entry.formulas), fields: fields });
     updatedCount++;
-    if (samples.length < 8) samples.push('更新 ' + (candidate.employeeId || '眷屬') + ' ' + candidate.name + ' → ' + candidate.route);
+    if (samples.length < 8) samples.push('更新 ' + (candidate.employeeId || '眷屬') + ' ' + candidate.name + ' → ' + tripRouteLabel_(fields[1]));
   });
   const counts = { new: newCount, updated: updatedCount, unchanged: unchangedCount, conflict: issueCount };
   const summary = tripRosterSummary_(counts, samples, issues, parsed.ignoredCount || 0, !assignments.length);
@@ -1720,6 +1918,7 @@ function tripRoomConfirm_(ss, request) {
     const saved = tripRoomCacheRead_(request.importId, access.ownerHash);
     if (!saved) return tripStatus_('expired');
     if (saved.kind === 'roster') return tripRosterConfirmSaved_(ss, saved, request.importId);
+    if (saved.kind === 'dining') return tripDiningConfirmSaved_(ss, saved, request.importId);
     if (!saved.assignments.length || saved.assignments.length > TRIP_ROOM_IMPORT_MAX_ASSIGNMENTS) return tripStatus_('invalid_request');
     const data = tripRoomEmployeeData_(ss), rows = data.table.rows;
     for (let index = 0; index < saved.assignments.length; index++) {
@@ -1751,6 +1950,8 @@ function tripRoomCancel_(ss, request) {
     const saved = tripRoomCacheRead_(request.importId, access.ownerHash);
     if (!saved) return tripStatus_('expired');
     CacheService.getScriptCache().remove(tripRoomImportKey_(request.importId));
+    if (saved.kind === 'dining') return { success: true, status: 'ok', kind: 'dining',
+      summary: '已取消，本次桌次資料沒有寫入。' };
     if (saved.kind === 'roster') return { success: true, status: 'ok', kind: 'roster',
       summary: '已取消，本次員工名單沒有寫入。' };
     return { success: true, status: 'ok', summary: '已取消，本次房號資料沒有寫入。' };
@@ -1759,7 +1960,7 @@ function tripRoomCancel_(ss, request) {
 
 function tripRoomAdmin_(ss, request) {
   const operation = request.operation;
-  if (!['authorize', 'previewText', 'previewFile', 'confirm', 'cancel'].includes(operation)) return tripStatus_('invalid_request');
+  if (!['authorize', 'previewText', 'previewFile', 'selectDiningRoute', 'confirm', 'cancel'].includes(operation)) return tripStatus_('invalid_request');
   if (operation === 'confirm' || operation === 'cancel') {
     if (!tripRoomImportId_(request.importId)) return tripStatus_('invalid_request');
     return operation === 'confirm' ? tripRoomConfirm_(ss, request) : tripRoomCancel_(ss, request);
@@ -1767,6 +1968,7 @@ function tripRoomAdmin_(ss, request) {
   const access = tripRoomAdminAccess_(ss, request.lineUserId);
   if (!access) return tripStatus_('forbidden');
   if (operation === 'authorize') return tripStatus_('approved');
+  if (operation === 'selectDiningRoute') return tripDiningSelectRoute_(ss, access, request);
   let parsed;
   if (operation === 'previewText') parsed = tripRoomTextCandidates_(request.text);
   else {
@@ -1790,6 +1992,11 @@ function tripRoomAdmin_(ss, request) {
       if (!roster.candidates.length && !(roster.issues && roster.issues.length)) return tripStatus_('no_rows');
       return tripRosterPreview_(ss, access.ownerHash, roster);
     }
+    let dining;
+    try { dining = tripDiningCandidatesFromTables_(workbook.tables); }
+    catch (ignored) { return tripStatus_('file_too_large'); }
+    if (dining.error) return tripStatus_(dining.error);
+    if (dining.headerFound) return tripDiningStart_(ss, access.ownerHash, dining);
     try { parsed = tripRoomCandidatesFromTables_(workbook.tables); }
     catch (ignored) { return tripStatus_('file_too_large'); }
   }
@@ -1797,4 +2004,303 @@ function tripRoomAdmin_(ss, request) {
   if (!parsed.headerFound) return tripStatus_('columns_not_found');
   if (!parsed.candidates.length && !(parsed.issues && parsed.issues.length)) return tripStatus_('no_rows');
   return tripRoomPreview_(ss, access.ownerHash, parsed);
+}
+
+// One route keeps one fixed seating plan for the entire trip. The complete
+// route plan is replaced only after its owner confirms an unchanged preview.
+const TRIP_DINING_HEADERS = ['人員識別碼', '路線ID', '桌號', '座位序號', '姓名', '飲食習慣'];
+
+function tripDiningRoutes_(ss) {
+  const table = tripTable_(ss, '旅遊路線', ['路線ID', '路線名稱', '交通方式', '開始日期', '結束日期']);
+  const allowed = TRIP_FUSEN_ROUTES.concat(['R02']), counts = Object.create(null);
+  table.rows.forEach(function (r) { const id = tripText_(r[0]); counts[id] = (counts[id] || 0) + 1; });
+  return table.rows.filter(function (r) { return allowed.includes(tripText_(r[0])) && counts[tripText_(r[0])] === 1; })
+    .map(function (r) {
+      const id = tripText_(r[0]), names = { 'R01-AC': '福森號第1梯次', 'R01-BD': '福森號第2梯次', R02: '台中南投' };
+      return { id: id, name: names[id] };
+    });
+}
+
+function tripDiningDiet_(value) {
+  const key = tripText_(value).normalize('NFKC').replace(/\s+/g, '').toLowerCase();
+  if (['素食', '素', '全素', '蛋奶素', '奶蛋素', '蛋素', '奶素', 'vegetarian', 'vegan', '1', '是', 'yes', 'true', '✓', '✔', 'v'].includes(key)) return '素食';
+  if (['', '葷', '葷食', '一般', '無', '否', '0', 'no', 'false'].includes(key)) return '';
+  return null;
+}
+
+function tripDiningData_(ss) {
+  const sheet = ss.getSheetByName('用餐安排');
+  if (!sheet) return { sheet: null, rows: [], snapshot: 'missing' };
+  const range = sheet.getDataRange(), displayed = range.getDisplayValues(), formulas = range.getFormulas();
+  if (TRIP_DINING_HEADERS.some(function (h, i) { return tripText_((displayed[0] || [])[i]) !== h; }) ||
+      formulas.some(function (row) { return row.some(function (v) { return !!v; }); })) throw new Error('Invalid dining schema');
+  const rows = displayed.slice(1).map(function (r) { return TRIP_DINING_HEADERS.map(function (_, i) { return tripText_(r[i]); }); });
+  while (rows.length && !rows[rows.length - 1].some(Boolean)) rows.pop();
+  return { sheet: sheet, rows: rows, snapshot: tripDigest_(JSON.stringify(rows)) };
+}
+
+function tripDiningEmployeeSnapshot_(rows) {
+  return tripDigest_(JSON.stringify(rows.map(function (r) {
+    return [tripParticipantKey_(r), tripText_(r[1]), tripText_(r[2]), tripText_(r[4])];
+  })));
+}
+
+function tripDiningCandidatesFromTables_(tables) {
+  const candidates = [], issues = [], routes = [];
+  let headerFound = false;
+  tables.forEach(function (rows, sheetIndex) {
+    let header = null;
+    for (let i = 0; i < Math.min(rows.length, 30); i++) {
+      const cells = rows[i] || [], types = cells.map(tripRoomHeaderKey_);
+      const name = types.indexOf('姓名'), table = types.indexOf('桌號') >= 0 ? types.indexOf('桌號') : types.indexOf('桌次');
+      if (name >= 0 && table >= 0) {
+        const diet = types.findIndex(function (key) { return ['飲食習慣', '飲食', '素食'].includes(key); });
+        header = { row: i, name: name, table: table, seat: types.indexOf('座位序號'), diet: diet }; break;
+      }
+      if (['桌次人數', '桌次', '桌號'].includes(types[0]) && cells.slice(1).some(function (v) { return !!tripText_(v); })) {
+        header = { row: i, horizontal: true }; break;
+      }
+    }
+    if (!header) return;
+    headerFound = true;
+    for (let i = 0; i < header.row; i++) {
+      const r = rows[i] || [], key = tripRoomHeaderKey_(r[0]);
+      if (['行程', '路線', '路線id', '參加方案'].includes(key)) {
+        const value = tripText_(r[1]);
+        if (!value) continue;
+        const route = tripRosterRoute_(value);
+        if (!route || !TRIP_FUSEN_ROUTES.concat(['R02']).includes(route)) routes.push('invalid');
+        else if (!routes.includes(route)) routes.push(route);
+      }
+    }
+    const tableColumns = Object.create(null), duplicateTables = Object.create(null);
+    if (header.horizontal) {
+      (rows[header.row] || []).slice(1, TRIP_ROOM_IMPORT_MAX_COLUMNS).forEach(function (value, index) {
+        const table = tripRoomValue_(value), column = index + 1;
+        if (!table) {
+          if (tripText_(value)) issues.push({ source: '工作表' + (sheetIndex + 1), value: tripText_(value), reason: 'invalid_table' });
+          return;
+        }
+        if (Object.keys(tableColumns).some(function (c) { return tableColumns[c] === table; })) duplicateTables[table] = true;
+        tableColumns[column] = table;
+      });
+    }
+    for (let i = header.row + 1; i < rows.length; i++) {
+      const row = rows[i] || [], source = '工作表' + (sheetIndex + 1) + ' 第' + (i + 1) + '列';
+      if (header.horizontal && ['合計', '總計', '人數', '備註'].includes(tripRoomHeaderKey_(row[0]))) continue;
+      const append = function (rawName, rawTable, rawSeat, duplicate, column) {
+        if (!tripText_(rawName)) return;
+        const name = tripRoomValue_(rawName), table = tripRoomValue_(rawTable), seat = tripRoomValue_(rawSeat);
+        const colored = typeof tripDiningCellVegetarian_ === 'function' && tripDiningCellVegetarian_(rows, i, column);
+        const explicitDiet = !header.horizontal && header.diet >= 0 ? tripDiningDiet_(row[header.diet]) : '';
+        const diet = colored ? '素食' : explicitDiet;
+        let reason = duplicate ? 'duplicate_table_header' : !name || /^\d+$/.test(name) ? 'invalid_name' : !table ? 'invalid_table' : '';
+        if (!reason && tripText_(rawSeat) && (!seat || !/^\d{1,3}$/.test(seat))) reason = 'invalid_seat';
+        if (!reason && diet === null) reason = 'invalid_diet';
+        if (reason) issues.push({ source: source, value: tripText_(rawName), reason: reason });
+        else candidates.push({ source: source, name: name, table: table, seat: seat, diet: diet });
+        if (candidates.length + issues.length > TRIP_ROOM_IMPORT_MAX_ASSIGNMENTS) throw new Error('Too many dining rows');
+      };
+      if (header.horizontal) Object.keys(tableColumns).forEach(function (column) {
+        append(row[Number(column)], tableColumns[column], row[0], duplicateTables[tableColumns[column]], Number(column));
+      });
+      else append(row[header.name], row[header.table], header.seat >= 0 ? row[header.seat] : '', false, header.name);
+    }
+  });
+  return { headerFound: headerFound, candidates: candidates, issues: issues, routeId: routes.length === 1 ? routes[0] : '',
+    error: routes.includes('invalid') || routes.length > 1 ? 'invalid_dining_route' : '' };
+}
+
+function tripDiningStart_(ss, ownerHash, parsed) {
+  if (!parsed.candidates.length) return { success: true, status: 'no_rows', kind: 'dining',
+    summary: ['沒有可匯入的桌次資料，請確認桌號與姓名。', ...tripDiningIssueLines_(parsed.issues || [])].join('\n').slice(0, 1800),
+    issueCount: (parsed.issues || []).length };
+  const routes = tripDiningRoutes_(ss);
+  if (parsed.routeId) {
+    if (!routes.some(function (r) { return r.id === parsed.routeId; })) return tripStatus_('invalid_dining_route');
+    return tripDiningPreview_(ss, ownerHash, parsed, parsed.routeId);
+  }
+  if (!routes.length) return tripStatus_('invalid_dining_route');
+  const importId = tripRoomCacheSave_(ownerHash, [], 'dining', { stage: 'choose_route', parsed: parsed });
+  if (!importId) return tripStatus_('preview_too_large');
+  return { success: true, status: 'choose_route', kind: 'dining', importId: importId,
+    expiresInSeconds: TRIP_ROOM_IMPORT_TTL_SECONDS, routes: routes,
+    summary: '已辨識桌次表，請選擇這份桌次適用的行程。選擇後會先預覽，不會立即寫入。' };
+}
+
+function tripDiningSelectRoute_(ss, access, request) {
+  if (!tripRoomImportId_(request.importId) || typeof request.routeId !== 'string') return tripStatus_('invalid_request');
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(4000)) return tripStatus_('busy');
+  try {
+    const currentAccess = tripRoomAdminAccess_(ss, request.lineUserId);
+    if (!currentAccess || currentAccess.ownerHash !== access.ownerHash) return tripStatus_('forbidden');
+    const saved = tripRoomCacheRead_(request.importId, access.ownerHash);
+    if (!saved) return tripStatus_('expired');
+    if (saved.kind !== 'dining' || !saved.metadata || saved.metadata.stage !== 'choose_route') return tripStatus_('invalid_request');
+    if (!tripDiningRoutes_(ss).some(function (r) { return r.id === request.routeId; })) return tripStatus_('invalid_dining_route');
+    const result = tripDiningPreview_(ss, access.ownerHash, saved.metadata.parsed, request.routeId);
+    if (['preview', 'no_rows'].includes(result.status)) CacheService.getScriptCache().remove(tripRoomImportKey_(request.importId));
+    return result;
+  } finally { lock.releaseLock(); }
+}
+
+function tripDiningIssueLines_(issues) {
+  const labels = { invalid_name: '姓名格式錯誤', invalid_table: '桌號格式錯誤', invalid_seat: '座位序號格式錯誤', invalid_diet: '飲食習慣無法判定',
+    duplicate_table_header: '桌號欄位重複', employee_not_found: '查無此人', ambiguous_employee: '同名人員無法判定',
+    employee_disabled: '人員已停用', route_mismatch: '不屬於這個行程', conflicting_dining: '同一人重複安排座位',
+    duplicate_seat: '同一座位有多位人員' };
+  return issues.slice(0, 6).map(function (issue) { return tripMessageText_(issue.value || issue.source, 60) + '：' + (labels[issue.reason] || '未匯入'); });
+}
+
+function tripDiningPreview_(ss, ownerHash, parsed, routeId) {
+  const data = tripDiningData_(ss), employees = tripEmployees_(ss).rows;
+  const names = Object.create(null), keys = Object.create(null), selected = Object.create(null), occupied = Object.create(null);
+  employees.forEach(function (row) {
+    const name = tripRoomNormalizeName_(row[1]), key = tripParticipantKey_(row);
+    if (!names[name]) names[name] = [];
+    names[name].push(row);
+    if (key) keys[key] = (keys[key] || 0) + 1;
+  });
+  const issues = (parsed.issues || []).slice();
+  parsed.candidates.forEach(function (candidate) {
+    const all = names[tripRoomNormalizeName_(candidate.name)] || [];
+    const matches = all.filter(function (r) { const ids = tripEmployeeRouteIds_(r[2]); return ids && ids.includes(routeId); });
+    const row = matches[0], key = row && tripParticipantKey_(row);
+    const reason = !all.length ? 'employee_not_found' : !matches.length ? 'route_mismatch' : matches.length !== 1 ? 'ambiguous_employee' :
+      tripText_(row[4]) !== '啟用' ? 'employee_disabled' : !key || keys[key] !== 1 ? 'ambiguous_employee' : '';
+    if (reason) { issues.push({ source: candidate.source, value: candidate.name, reason: reason }); return; }
+    const entry = { participantKey: key, name: tripText_(row[1]), table: candidate.table, seat: candidate.seat,
+      diet: candidate.diet || '', conflict: false };
+    if (selected[key]) {
+      selected[key].conflict = true;
+      entry.conflict = true;
+      issues.push({ source: candidate.source, value: candidate.name, reason: 'conflicting_dining' });
+    } else selected[key] = entry;
+    if (candidate.seat) {
+      const seatKey = candidate.table + '\u0000' + candidate.seat;
+      if (occupied[seatKey] && occupied[seatKey] !== key) {
+        selected[occupied[seatKey]].conflict = true;
+        selected[key].conflict = true;
+        issues.push({ source: candidate.source, value: candidate.name, reason: 'duplicate_seat' });
+      } else occupied[seatKey] = key;
+    }
+  });
+  const assignments = Object.keys(selected).filter(function (key) { return !selected[key].conflict; }).map(function (key) {
+    const r = selected[key]; return { participantKey: r.participantKey, name: r.name, table: r.table, seat: r.seat, diet: r.diet };
+  });
+  const previous = data.rows.filter(function (r) { return r[1] === routeId; });
+  const retained = data.rows.filter(function (r) { return r[1] !== routeId && r.some(Boolean); }).length;
+  const removed = previous.filter(function (r) { return !assignments.some(function (a) { return a.participantKey === r[0]; }); }).length;
+  const route = tripDiningRoutes_(ss).filter(function (r) { return r.id === routeId; })[0];
+  if (!route) return tripStatus_('invalid_dining_route');
+  const tableCounts = Object.create(null);
+  assignments.forEach(function (a) { tableCounts[a.table] = (tableCounts[a.table] || 0) + 1; });
+  const lines = ['桌次匯入預覽｜' + tripMessageText_(route.name, 150),
+    '確認後將取代這個行程的整份原桌次；其他行程保留。',
+    '原安排 ' + previous.length + ' 人 → 新安排 ' + assignments.length + ' 人',
+    '未匹配／未匯入 ' + issues.length + ' 筆；移除原安排 ' + removed + ' 人；其他行程保留 ' + retained + ' 筆',
+    '素食 ' + assignments.filter(function (a) { return a.diet === '素食'; }).length + ' 人',
+    ...Object.keys(tableCounts).slice(0, 30).map(function (table) { return table + '：' + tableCounts[table] + ' 人'; })];
+  lines.push('', ...assignments.slice(0, 8).map(function (a) { return a.name + (a.diet === '素食' ? '(素食)' : '') + ' → ' + a.table; }));
+  if (issues.length) lines.push('', ...tripDiningIssueLines_(issues));
+  if (!assignments.length) return { success: true, status: 'no_rows', kind: 'dining',
+    summary: ['沒有可寫入的桌次；原安排保持不變。', ...lines].join('\n').slice(0, 1800),
+    matchedCount: 0, issueCount: issues.length, issues: issues.slice(0, 100) };
+  const importId = tripRoomCacheSave_(ownerHash, assignments, 'dining', { stage: 'preview', routeId: routeId,
+    diningSnapshot: data.snapshot, employeeSnapshot: tripDiningEmployeeSnapshot_(employees) });
+  if (!importId) return tripStatus_('preview_too_large');
+  return { success: true, status: 'preview', kind: 'dining', importId: importId, canConfirm: true,
+    expiresInSeconds: TRIP_ROOM_IMPORT_TTL_SECONDS, summary: lines.join('\n').slice(0, 1800),
+    matchedCount: assignments.length, issueCount: issues.length, removedCount: removed,
+    previousCount: previous.length, issues: issues.slice(0, 100) };
+}
+
+function tripDiningConfirmSaved_(ss, saved, importId) {
+  const meta = saved.metadata;
+  if (!meta || meta.stage !== 'preview' || !TRIP_FUSEN_ROUTES.concat(['R02']).includes(meta.routeId) ||
+      !saved.assignments.length || saved.assignments.length > TRIP_ROOM_IMPORT_MAX_ASSIGNMENTS) return tripStatus_('invalid_request');
+  if (!tripDiningRoutes_(ss).some(function (r) { return r.id === meta.routeId; })) return tripStatus_('stale');
+  const data = tripDiningData_(ss), employees = tripEmployees_(ss).rows;
+  if (data.snapshot !== meta.diningSnapshot || tripDiningEmployeeSnapshot_(employees) !== meta.employeeSnapshot) return tripStatus_('stale');
+  const seen = Object.create(null), seats = Object.create(null), replacement = [];
+  for (let i = 0; i < saved.assignments.length; i++) {
+    const a = saved.assignments[i], matches = employees.filter(function (r) { return tripParticipantKey_(r) === a.participantKey; });
+    const row = matches[0], ids = row && tripEmployeeRouteIds_(row[2]);
+    if (matches.length !== 1 || tripText_(row[1]) !== a.name || tripText_(row[4]) !== '啟用' || !ids || !ids.includes(meta.routeId) ||
+        seen[a.participantKey] || !tripRoomValue_(a.table) || tripRoomValue_(a.table) !== a.table ||
+        (a.seat && !/^\d{1,3}$/.test(a.seat)) || !['', '素食'].includes(a.diet || '')) return tripStatus_('stale');
+    const seatKey = a.table + '\u0000' + a.seat;
+    if (a.seat && seats[seatKey]) return tripStatus_('invalid_request');
+    seats[seatKey] = true; seen[a.participantKey] = true;
+    replacement.push([a.participantKey, meta.routeId, a.table, a.seat, a.name, a.diet || '']);
+  }
+  const kept = data.rows.filter(function (r) { return r[1] !== meta.routeId && r.some(Boolean); });
+  const rows = [TRIP_DINING_HEADERS].concat(kept, replacement), oldHeight = data.rows.length + 1;
+  while (rows.length < oldHeight) rows.push(['', '', '', '', '', '']);
+  const sheet = data.sheet || ss.insertSheet('用餐安排');
+  try {
+    if (rows.length > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), rows.length - sheet.getMaxRows());
+    sheet.getRange(1, 1, rows.length, TRIP_DINING_HEADERS.length).setValues(rows);
+  } catch (error) {
+    // The route plan is written in one call. If its first write fails, do not
+    // leave an empty, invalid new table blocking all later seating queries.
+    if (!data.sheet) ss.deleteSheet(sheet);
+    throw error;
+  }
+  SpreadsheetApp.flush();
+  CacheService.getScriptCache().remove(tripRoomImportKey_(importId));
+  return { success: true, status: 'ok', kind: 'dining', updatedCount: replacement.length,
+    summary: '已更新 ' + replacement.length + ' 人的桌次。其他行程的桌次保留。' };
+}
+
+function tripDiningReply_(ss, access, routeIds) {
+  const data = tripDiningData_(ss), employees = tripEmployees_(ss).rows;
+  const ownRows = employees.filter(function (r) {
+    return access.employee.id ? tripEmployeeId_(r[0]) === access.employee.id :
+      !tripEmployeeId_(r[0]) && tripRoomNormalizeName_(r[1]) === tripRoomNormalizeName_(access.employee.name);
+  });
+  if (ownRows.length !== 1) return '';
+  const own = ownRows[0], ownKey = tripParticipantKey_(own), keys = Object.create(null), routeNames = Object.create(null);
+  if (!ownKey) return '';
+  employees.forEach(function (r) { const key = tripParticipantKey_(r); if (key) { if (!keys[key]) keys[key] = []; keys[key].push(r); } });
+  tripDiningRoutes_(ss).forEach(function (r) { routeNames[r.id] = r.name; });
+  const sections = [];
+  routeIds.forEach(function (routeId) {
+    if (!TRIP_FUSEN_ROUTES.concat(['R02']).includes(routeId)) return;
+    let seat = '', diet = '', colleagues = [];
+    const rows = data.rows.filter(function (r) { return r[1] === routeId; }), hasRoutePlan = rows.length > 0;
+    if (hasRoutePlan) {
+      const ownDining = rows.filter(function (r) { return r[0] === ownKey; });
+      if (ownDining.length === 1 && tripRoomNormalizeName_(ownDining[0][4]) === tripRoomNormalizeName_(own[1])) {
+        seat = tripRoomValue_(ownDining[0][2]);
+        diet = ownDining[0][5] === '素食' ? '素食' : '';
+        if (seat) rows.forEach(function (r) {
+          if (r[0] === ownKey || r[2] !== seat || rows.filter(function (q) { return q[0] === r[0]; }).length !== 1) return;
+          const matches = keys[r[0]] || [], person = matches[0], ids = person && tripEmployeeRouteIds_(person[2]);
+          if (matches.length === 1 && tripText_(person[4]) === '啟用' && ids && ids.includes(routeId) &&
+              tripRoomNormalizeName_(person[1]) === tripRoomNormalizeName_(r[4])) colleagues.push(tripText_(person[1]));
+        });
+      }
+    } else {
+      // H predates multiple routes and cannot identify which journey a seat
+      // belongs to. Use it only when both people have one explicit route.
+      const ownRouteIds = tripEmployeeRouteIds_(own[2]);
+      seat = ownRouteIds && ownRouteIds.length === 1 ? tripRoomValue_(own[7]) : '';
+      if (seat) employees.forEach(function (r) {
+        const key = tripParticipantKey_(r), ids = tripEmployeeRouteIds_(r[2]);
+        if (key && key !== ownKey && (keys[key] || []).length === 1 && tripText_(r[4]) === '啟用' && ids && ids.length === 1 && ids.includes(routeId) &&
+            tripRoomValue_(r[7]) === seat) colleagues.push(tripText_(r[1]));
+      });
+    }
+    // An absent legacy seat keeps the existing image-only experience.
+    if (!hasRoutePlan && !seat) return;
+    let text = seat ? '您今日的用餐座位為：' + seat : '您的用餐座位尚未安排。';
+    if (seat && diet) text += '\n飲食：素食';
+    if (seat && colleagues.length) text += '\n您與' + colleagues.slice(0, 50).map(function (n) { return tripMessageText_(n, 50); }).join('、') +
+      (colleagues.length > 50 ? '等人' : '') + '同桌。';
+    if (routeIds.length > 1) text = '【' + tripMessageText_(routeNames[routeId] || routeId, 150) + '】\n' + text;
+    sections.push(text);
+  });
+  return sections.join('\n\n').slice(0, 3800);
 }

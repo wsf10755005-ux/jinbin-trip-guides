@@ -1,14 +1,14 @@
 {
   "r01": {
     "title": "福森號兩梯次",
-    "subtitle": "第1梯次（AC）・第2梯次（BD）",
+    "subtitle": "第1梯次・第2梯次",
     "code": "R01",
     "dates": "2027.01.03 — 01.04",
     "start": "2027-01-03",
     "end": "2027-01-04",
     "duration": "兩天一夜",
     "transport": "高鐵來回・福森號",
-    "notice": "請依名單確認第1梯次（AC）或第2梯次（BD），再查看對應行程。",
+    "notice": "請依名單確認第1梯次或第2梯次，再查看對應行程。",
     "source": "兩梯次行程資料見 fusen-itineraries.mjs",
     "days": []
   },
