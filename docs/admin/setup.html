@@ -7,13 +7,13 @@
   <meta name="referrer" content="no-referrer">
   <title>系統更新｜金賓員工旅遊</title>
   <link rel="stylesheet" href="admin.css?v=20261105">
-  <script src="setup.js?v=xlsx-zip-fix-20261112" defer></script>
+  <script src="setup.js?v=workbook-vehicle-20261113" defer></script>
 </head>
 <body>
-  <header class="topbar"><div><span class="brand">金賓員工旅遊</span><h1>名單與桌次匯入更新</h1></div></header>
+  <header class="topbar"><div><span class="brand">金賓員工旅遊</span><h1>名單、桌次與車次更新</h1></div></header>
   <main>
-    <p class="notice">Excel 讀取修正：若收到無法開啟檔案的訊息，請先完成<a href="fix-excel.html?v=xlsx-zip-fix-20261112">這次 Apps Script 更新</a>；Cloudflare 不需重複部署。</p>
-    <p>參加方案可填中文行程名稱。A 方案是福森號，以梯次 1、2 區分；B 方案是台中南投。管理員可直接傳桌次 Excel，先選行程、核對預覽，再確認匯入。</p>
+    <p class="notice">這次新增「車次」查詢，請依序更新 Apps Script 和 Cloudflare 各一次。原本的 Excel 讀取修正已包含在這一版。</p>
+    <p>同一本 Excel 可放員工名單、桌次和車次分頁，系統會依序讓管理員預覽與確認。已存在的人員會比對更新；不會因為重傳同一份檔案重複新增。</p>
     <section class="reminder-card">
       <h2>1. 更新 Apps Script</h2>
       <p class="field-hint">名單 Excel 的「參加方案」可填 A、B、A+B，另加「梯次」欄填 1 或 2；只參加台中南投時，梯次留空。也可在參加方案直接填「福森號第1梯次」「福森號第2梯次」或「台中南投」。</p>
@@ -37,6 +37,15 @@
     <p id="setup-status" role="status" class="field-hint"></p>
     <a class="primary full" href="./">開啟手機管理頁 →</a>
     <section class="reminder-card">
+      <h2>同一本 Excel 的確認順序</h2>
+      <ol>
+        <li>先核對名單；確認後寫入人員資料。名單完全相同時，直接接續其他分頁。</li>
+        <li>接著選擇桌次所屬行程、核對桌號與素食，另按一次確認。</li>
+        <li>最後核對車次，確認後更新人員的乘車安排。</li>
+      </ol>
+      <p class="field-hint">每一步分別寫入。取消後面的步驟，不會回復前面已確認的資料。查無姓名、重名、停用或不屬於該行程的人員會列出，請核對後再確認。</p>
+    </section>
+    <section class="reminder-card">
       <h2>之後怎麼匯入桌次</h2>
       <ol>
         <li>在官方帳號一對一聊天室，直接傳旅行社的桌次 .xlsx 檔，不用先輸入「管理」。</li>
@@ -47,6 +56,15 @@
       <p>姓名文字或姓名格底色為綠色，會記為「素食」。桌次檔請保留 .xlsx；CSV 不會保留顏色。</p>
       <p class="field-hint">請核對預覽中的素食名單。如果綠色是由「條件格式」自動顯示，請先改成姓名格固定的綠字或綠底再傳送。</p>
       <p>員工點「桌次」，即可看到自己的桌號、同桌名單與本人素食標記。整個行程固定同一桌。</p>
+      <p>兩梯次共用同一張桌次表時，目前請先選第1梯次匯入，再重傳同一本並選第2梯次；不需要拆檔。每次只更新所選行程，不從桌號猜梯次。尚未分梯次者請先補名單。</p>
+    </section>
+    <section class="reminder-card">
+      <h2>車次 Excel 格式</h2>
+      <p>保留旅行社的橫向排版：上方標明「福森號梯次1」「福森號梯次2」，下一列放「1-1車」「1-2車」「2-1車」等車號，每欄下面列出搭車人員；左側人數序號和中間空白欄會略過。</p>
+      <p>支援合併的梯次表頭與括號人數。完整車號會保留，不會從車號猜梯次。名單需先匯入，眷屬以自己的完整姓名配對。</p>
+      <p>車次匯入後存於「乘車安排」；桌次存於「用餐安排」。同時參加兩個行程的人，兩邊安排各自保存。</p>
+      <p>新的下方選單有五個按鈕：行程、車次、桌次、房號、旅遊攻略。部署完成後會切換新版選單。</p>
+      <img src="../assets/rich-menu-five.png?v=workbook-vehicle-20261113" alt="行程、車次、桌次、房號與旅遊攻略五個按鈕" style="display:block;width:100%;height:auto;border-radius:12px">
     </section>
     <p class="notice">名單匯入先核對預覽，再按「確認匯入」。尚未分梯次的新福森號人員，LINE 會提示聯絡承辦人。眷屬欄填 1，員工編號、部門可留空，仍可輸入全名綁定。</p>
     <p class="notice">原本 ADMIN_PASSWORD、API_SECRET 和 LINE 密鑰會沿用。福森號兩梯次依旅行社參考行程整理，車票與集合時間以承辦人最終通知為準。</p>
