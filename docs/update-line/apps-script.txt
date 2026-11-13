@@ -10,7 +10,7 @@ const TRIP_FUSEN_ROUTES = ['R01-AC', 'R01-BD'];
 const TRIP_FUSEN_PENDING = '福森號梯次尚未設定，請聯絡旅遊承辦人。';
 
 function doGet() {
-  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'workbook-vehicle-20261113' });
+  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'agency-layout-20261113' });
 }
 
 function doPost(e) {
@@ -1273,7 +1273,7 @@ function tripRoomWorkbookTables_(filename, bytes) {
     totalBytes += entryBytes.length;
     if (totalBytes > TRIP_ROOM_IMPORT_MAX_UNZIPPED_BYTES) return { error: 'file_too_large' };
     if (/^(EncryptionInfo|EncryptedPackage)$/i.test(name)) return { error: 'encrypted_or_invalid_file' };
-    if (/^(xl\/sharedStrings\.xml|xl\/styles\.xml|xl\/theme\/theme1\.xml|xl\/worksheets\/[^/]+\.xml)$/i.test(name)) {
+    if (/^(xl\/workbook\.xml|xl\/_rels\/workbook\.xml\.rels|xl\/sharedStrings\.xml|xl\/styles\.xml|xl\/theme\/theme1\.xml|xl\/worksheets\/[^/]+\.xml)$/i.test(name)) {
       entries[name.toLowerCase()] = blobs[i].getDataAsString('UTF-8');
     }
   }
@@ -1285,7 +1285,44 @@ function tripRoomWorkbookTables_(filename, bytes) {
   }).sort();
   if (sheetNames.length > TRIP_ROOM_IMPORT_MAX_SHEETS) return { error: 'file_too_large' };
   if (!sheetNames.length) return { error: 'encrypted_or_invalid_file' };
-  return { tables: sheetNames.map(function (name) { return tripRoomWorksheetRows_(entries[name], shared, styles); }) };
+  const worksheetLabels = tripRoomWorkbookSheetLabels_(entries['xl/workbook.xml'], entries['xl/_rels/workbook.xml.rels']);
+  return { tables: sheetNames.map(function (name) {
+    const rows = tripRoomWorksheetRows_(entries[name], shared, styles);
+    if (worksheetLabels[name]) rows.sheetName = worksheetLabels[name];
+    return rows;
+  }) };
+}
+
+function tripRoomWorkbookSheetLabels_(workbookXml, relationshipsXml) {
+  const labels = Object.create(null), targets = Object.create(null), counts = Object.create(null);
+  if (!workbookXml || !relationshipsXml) return labels;
+  tripRoomXmlElements_(relationshipsXml, 'Relationship').forEach(function (relationship) {
+    const id = tripRoomXmlAttribute_(relationship.attributes, 'Id');
+    const type = tripRoomXmlAttribute_(relationship.attributes, 'Type');
+    let target = tripRoomXmlAttribute_(relationship.attributes, 'Target');
+    if (!id || !/\/worksheet$/i.test(type) || /^external$/i.test(tripRoomXmlAttribute_(relationship.attributes, 'TargetMode'))) return;
+    try { target = decodeURIComponent(target).replace(/\\/g, '/'); } catch (ignored) { return; }
+    const parts = (target.charAt(0) === '/' ? target.slice(1) : 'xl/' + target).split('/'), resolved = [];
+    for (let i = 0; i < parts.length; i++) {
+      if (!parts[i] || parts[i] === '.') continue;
+      if (parts[i] === '..') { if (!resolved.length) return; resolved.pop(); }
+      else resolved.push(parts[i]);
+    }
+    const path = resolved.join('/').toLowerCase();
+    if (!/^xl\/worksheets\/[^/]+\.xml$/.test(path)) return;
+    counts[id] = (counts[id] || 0) + 1;
+    targets[id] = path;
+  });
+  const pathCounts = Object.create(null);
+  tripRoomXmlElements_(workbookXml, 'sheet').forEach(function (sheet) {
+    const id = tripRoomXmlAttribute_(sheet.attributes, 'r:id'), name = tripRoomXmlAttribute_(sheet.attributes, 'name');
+    if (!name || name.length > 100 || counts[id] !== 1 || !targets[id]) return;
+    const path = targets[id];
+    pathCounts[path] = (pathCounts[path] || 0) + 1;
+    labels[path] = name;
+  });
+  Object.keys(labels).forEach(function (path) { if (pathCounts[path] !== 1) delete labels[path]; });
+  return labels;
 }
 
 function tripRoomHeaderKey_(value) {
@@ -2186,9 +2223,7 @@ function tripRoomAdmin_(ss, request) {
         return (roster.rosterTableIndices || []).includes(index) ? [] : table;
       });
       vehicle = tripVehicleCandidatesFromTables_(remainingTables);
-      const diningTables = remainingTables.map(function (table, index) {
-        return (vehicle.vehicleTableIndices || vehicle.carTableIndices || []).includes(index) ? [] : table;
-      });
+      const diningTables = tripImportDiningTables_(remainingTables, vehicle);
       dining = tripDiningCandidatesFromTables_(diningTables);
     }
     catch (ignored) { return tripStatus_('file_too_large'); }
@@ -2261,6 +2296,29 @@ function tripDiningEmployeeSnapshot_(rows) {
   })));
 }
 
+function tripDiningSheetScope_(table) {
+  const name = tripText_(table && table.sheetName).normalize('NFKC');
+  const fusen = /阿里山|福(?:森|勝)號/.test(name), city = /台中.*南投|南投.*台中/.test(name);
+  return fusen === city ? '' : fusen ? 'R01' : 'R02';
+}
+
+function tripImportDiningTables_(tables, vehicle) {
+  const regions = Array.isArray(vehicle.vehicleRegions) ? vehicle.vehicleRegions : null;
+  return tables.map(function (table, index) {
+    if (!regions) return (vehicle.vehicleTableIndices || vehicle.carTableIndices || []).includes(index) ? [] : table;
+    const columns = [];
+    regions.filter(function (region) { return region.sheetIndex === index; }).forEach(function (region) {
+      (region.columns || []).forEach(function (column) { if (!columns.includes(column)) columns.push(column); });
+    });
+    if (!columns.length) return table;
+    const copy = table.map(function (row) { return row.slice(); });
+    if (table.sheetName !== undefined) copy.sheetName = table.sheetName;
+    if (table.cellStyles) copy.cellStyles = table.cellStyles;
+    copy.forEach(function (row) { columns.forEach(function (column) { row[column] = ''; }); });
+    return copy;
+  });
+}
+
 function tripDiningCandidatesFromTables_(tables) {
   const candidates = [], issues = [], routes = [];
   let headerFound = false;
@@ -2273,12 +2331,16 @@ function tripDiningCandidatesFromTables_(tables) {
         const diet = types.findIndex(function (key) { return ['飲食習慣', '飲食', '素食'].includes(key); });
         header = { row: i, name: name, table: table, seat: types.indexOf('座位序號'), diet: diet }; break;
       }
-      if (['桌次人數', '桌次', '桌號'].includes(types[0]) && cells.slice(1).some(function (v) { return !!tripText_(v); })) {
-        header = { row: i, horizontal: true }; break;
+      for (let column = 0; column < cells.length; column++) {
+        if (['桌次人數', '桌次', '桌號'].includes(types[column]) && cells.slice(column + 1).some(function (v) { return !!tripText_(v); })) {
+          header = { row: i, horizontal: true, start: column }; break;
+        }
       }
+      if (header) break;
     }
     if (!header) return;
     headerFound = true;
+    const routeScope = tripDiningSheetScope_(rows);
     for (let i = 0; i < header.row; i++) {
       const r = rows[i] || [], key = tripRoomHeaderKey_(r[0]);
       if (['行程', '路線', '路線id', '參加方案'].includes(key)) {
@@ -2291,20 +2353,29 @@ function tripDiningCandidatesFromTables_(tables) {
     }
     const tableColumns = Object.create(null), duplicateTables = Object.create(null);
     if (header.horizontal) {
-      (rows[header.row] || []).slice(1, TRIP_ROOM_IMPORT_MAX_COLUMNS).forEach(function (value, index) {
-        const table = tripRoomValue_(value), column = index + 1;
+      const columns = rows[header.row] || [];
+      for (let column = header.start + 1; column < Math.min(columns.length, TRIP_ROOM_IMPORT_MAX_COLUMNS); column++) {
+        const value = columns[column], table = tripRoomValue_(value);
+        if (['桌次人數', '桌次', '桌號'].includes(tripRoomHeaderKey_(value))) break;
         if (!table) {
           if (tripText_(value)) issues.push({ source: '工作表' + (sheetIndex + 1), value: tripText_(value), reason: 'invalid_table' });
-          return;
+          continue;
         }
-        if (Object.keys(tableColumns).some(function (c) { return tableColumns[c] === table; })) duplicateTables[table] = true;
-        tableColumns[column] = table;
-      });
+        let context = tripText_(rows.sheetName) || '工作表' + (sheetIndex + 1);
+        for (let above = header.row - 1; above >= 0; above--) {
+          const label = tripText_((rows[above] || [])[column]);
+          if (label && !/^\d+$/.test(label)) { context = label; break; }
+        }
+        const groupKey = context + '\u0000' + table;
+        if (Object.keys(tableColumns).some(function (c) { return tableColumns[c].groupKey === groupKey; })) duplicateTables[groupKey] = true;
+        tableColumns[column] = { table: table, context: context, groupKey: groupKey };
+      }
     }
     for (let i = header.row + 1; i < rows.length; i++) {
       const row = rows[i] || [], source = '工作表' + (sheetIndex + 1) + ' 第' + (i + 1) + '列';
-      if (header.horizontal && ['合計', '總計', '人數', '備註'].includes(tripRoomHeaderKey_(row[0]))) continue;
-      const append = function (rawName, rawTable, rawSeat, duplicate, column) {
+      const ordinal = header.horizontal ? row[header.start] : '';
+      if (header.horizontal && ['合計', '總計', '人數', '桌次', '桌號', '備註'].includes(tripRoomHeaderKey_(ordinal))) continue;
+      const append = function (rawName, rawTable, rawSeat, duplicate, column, context) {
         if (!tripText_(rawName)) return;
         const name = tripRoomValue_(rawName), table = tripRoomValue_(rawTable), seat = tripRoomValue_(rawSeat);
         const colored = typeof tripDiningCellVegetarian_ === 'function' && tripDiningCellVegetarian_(rows, i, column);
@@ -2314,13 +2385,19 @@ function tripDiningCandidatesFromTables_(tables) {
         if (!reason && tripText_(rawSeat) && (!seat || !/^\d{1,3}$/.test(seat))) reason = 'invalid_seat';
         if (!reason && diet === null) reason = 'invalid_diet';
         if (reason) issues.push({ source: source, value: tripText_(rawName), reason: reason });
-        else candidates.push({ source: source, name: name, table: table, seat: seat, diet: diet });
+        else {
+          const candidate = { source: source, name: name, table: table, seat: seat, diet: diet };
+          if (routeScope) candidate.routeScope = routeScope;
+          if (context) candidate.context = context;
+          candidates.push(candidate);
+        }
         if (candidates.length + issues.length > TRIP_ROOM_IMPORT_MAX_ASSIGNMENTS) throw new Error('Too many dining rows');
       };
       if (header.horizontal) Object.keys(tableColumns).forEach(function (column) {
-        append(row[Number(column)], tableColumns[column], row[0], duplicateTables[tableColumns[column]], Number(column));
+        const entry = tableColumns[column];
+        append(row[Number(column)], entry.table, ordinal, duplicateTables[entry.groupKey], Number(column), entry.context);
       });
-      else append(row[header.name], row[header.table], header.seat >= 0 ? row[header.seat] : '', false, header.name);
+      else append(row[header.name], row[header.table], header.seat >= 0 ? row[header.seat] : '', false, header.name, '');
     }
   });
   return { headerFound: headerFound, candidates: candidates, issues: issues, routeId: routes.length === 1 ? routes[0] : '',
@@ -2396,6 +2473,8 @@ function tripDiningPreview_(ss, ownerHash, parsed, routeId) {
   });
   const issues = (parsed.issues || []).slice();
   parsed.candidates.forEach(function (candidate) {
+    if (candidate.routeScope === 'R01' && !TRIP_FUSEN_ROUTES.includes(routeId)) return;
+    if (candidate.routeScope === 'R02' && routeId !== 'R02') return;
     const all = names[tripRoomNormalizeName_(candidate.name)] || [];
     const matches = all.filter(function (r) { const ids = tripEmployeeRouteIds_(r[2]); return ids && ids.includes(routeId); });
     const row = matches[0], key = row && tripParticipantKey_(row);
@@ -2553,8 +2632,19 @@ function tripVehicleRoute_(value, batch) {
   return TRIP_FUSEN_ROUTES.concat(['R02']).includes(route) ? route : '';
 }
 
+function tripVehicleHeader_(value) {
+  const label = tripText_(value).normalize('NFKC').replace(/\s+/g, '').replace(/\(\d+人\)$/, '');
+  return /^(?:(?:第)?(?:\d{1,3}|[一二三四五六七八九十百]{1,4})|[A-Za-z]{1,3}\d{1,3})(?:-\d{1,3})?(?:號)?車$/.test(label)
+    ? tripRoomValue_(label) : '';
+}
+
+function tripVehicleSheetRoute_(name) {
+  const label = tripText_(name).normalize('NFKC').replace(/\s+/g, '');
+  return /^(?:台中南投|南投台中)(?:行程|旅遊|車次|用車|乘車|$)/.test(label) ? 'R02' : '';
+}
+
 function tripVehicleCandidatesFromTables_(tables) {
-  const candidates = [], issues = [], routeIds = [], vehicleTableIndices = [];
+  const candidates = [], issues = [], routeIds = [], vehicleTableIndices = [], vehicleRegions = [];
   let headerFound = false;
   tables.forEach(function (rows, sheetIndex) {
     let header = null;
@@ -2567,13 +2657,17 @@ function tripVehicleCandidatesFromTables_(tables) {
         const batch = types.findIndex(function (_, column) { return tripRosterHeaderType_(cells[column]) === 'fusenCombo'; });
         header = { row: rowIndex, name: names[0], vehicle: vehicle, route: route, batch: batch }; break;
       }
-      if (['人數', '乘車人數', '序號', '編號'].includes(types[0]) && cells.slice(1).some(function (value) {
-        return /車$/.test(tripText_(value)) && !['車次', '車號', '車輛'].includes(tripText_(value));
+      if (['人數', '乘車人數', '序號', '編號', '車次', '車號'].includes(types[0]) && cells.slice(1).some(function (value) {
+        return !!tripVehicleHeader_(value);
       })) { header = { row: rowIndex, horizontal: true }; break; }
     }
     if (!header) return;
     headerFound = true; vehicleTableIndices.push(sheetIndex);
-    let defaultRoute = '';
+    const regionColumns = header.horizontal ? (rows[header.row] || []).slice(0, TRIP_ROOM_IMPORT_MAX_COLUMNS).map(function (value, column) {
+      return column > 0 && tripVehicleHeader_(value) ? column : -1;
+    }).filter(function (column) { return column >= 0; }) : [header.vehicle];
+    vehicleRegions.push({ sheetIndex: sheetIndex, columns: regionColumns, headerRow: header.row });
+    let defaultRoute = tripVehicleSheetRoute_(rows.sheetName);
     for (let i = 0; i < header.row; i++) {
       const row = rows[i] || [], key = tripRoomHeaderKey_(row[0]);
       if (['行程', '路線', '路線id', '參加方案'].includes(key) && tripText_(row[1])) defaultRoute = tripVehicleRoute_(row[1]);
@@ -2581,8 +2675,9 @@ function tripVehicleCandidatesFromTables_(tables) {
     const columns = Object.create(null), seenVehicles = Object.create(null);
     if (header.horizontal) {
       (rows[header.row] || []).slice(1, TRIP_ROOM_IMPORT_MAX_COLUMNS).forEach(function (rawVehicle, offset) {
-        if (!tripText_(rawVehicle)) return;
-        const column = offset + 1, vehicle = tripRoomValue_(rawVehicle);
+        const vehicle = tripVehicleHeader_(rawVehicle);
+        if (!vehicle) return;
+        const column = offset + 1;
         let routeId = '';
         for (let i = header.row - 1; i >= 0 && !routeId; i--) routeId = tripVehicleRoute_((rows[i] || [])[column]);
         if (!routeId) routeId = defaultRoute;
@@ -2624,7 +2719,8 @@ function tripVehicleCandidatesFromTables_(tables) {
       }
     }
   });
-  return { headerFound: headerFound, candidates: candidates, issues: issues, routeIds: routeIds, vehicleTableIndices: vehicleTableIndices };
+  return { headerFound: headerFound, candidates: candidates, issues: issues, routeIds: routeIds,
+    vehicleTableIndices: vehicleTableIndices, vehicleRegions: vehicleRegions };
 }
 
 function tripVehicleData_(ss) {

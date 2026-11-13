@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="referrer" content="no-referrer">
+  <title>旅行社 Excel 讀取修正｜金賓員工旅遊</title>
+  <link rel="stylesheet" href="admin.css?v=20261105">
+  <script src="fix-agency.js?v=agency-layout-20261113" defer></script>
+</head>
+<body>
+  <header class="topbar"><div><span class="brand">金賓員工旅遊</span><h1>旅行社 Excel 讀取修正</h1></div></header>
+  <main>
+    <p class="notice">這次只需更新 Apps Script。Cloudflare 已完成車次功能的部署。</p>
+    <section class="reminder-card">
+      <h2>1. 複製完整程式</h2>
+      <p>支援不同午餐區各自從第 1 桌編號；同一分頁左側放車次、右側放桌次，也可一起辨識。備註與接駁車名單會略過。</p>
+      <button class="primary full" id="copy-apps" disabled>正在準備程式…</button>
+      <p id="setup-status" role="status" class="field-hint"></p>
+    </section>
+    <section class="reminder-card">
+      <h2>2. 儲存並更新原部署</h2>
+      <a class="text-button" href="https://script.google.com/home/projects/1qenRhxJ6T2KAYu7RRbbrTSbJy2A8m78xTJFRMTqGVBomhTSyYdqd8OyM/edit" target="_blank" rel="noopener noreferrer">開啟原本的 Apps Script ↗</a>
+      <ol>
+        <li>將 Code.gs 全選，貼上完整程式並儲存。</li>
+        <li>點「部署 → 管理部署作業」，選原本的網頁應用程式。</li>
+        <li>點編輯圖示，版本選「新版本」，再按「部署」。沿用原本的 /exec 網址。</li>
+      </ol>
+      <p class="field-hint">API_SECRET 等指令碼屬性沿用現有設定。</p>
+      <a class="text-button" href="https://script.google.com/macros/s/AKfycbyNHd8T0-5ZQSRxApv1vlTLkaa5_PqLo_7JlzEXhnJ4qaQfxDo_Zf1ncBcuqAp_dq-h/exec" target="_blank" rel="noopener noreferrer">開啟部署版本檢查 ↗</a>
+      <p class="field-hint">看到 build 為 agency-layout-20261113，代表這次修正已上線。</p>
+    </section>
+    <section class="reminder-card">
+      <h2>3. 在 LINE 重傳原本 Excel</h2>
+      <p>先核對名單，再核對所選行程的桌次，最後核對車次。每一步都先預覽，按「確認匯入」後才會寫入。</p>
+      <p>桌次仍按行程分別確認：福森號第1梯次、第2梯次、台中南投。若要更新三個行程，請重傳同一本，分別選擇行程，不用拆檔。</p>
+      <p class="field-hint">已存在的名單會比對更新。取消後面的步驟，前面已確認的資料仍會保留。上傳 .xlsx 才能保留姓名綠字或綠底的素食標記。</p>
+    </section>
+  </main>
+</body>
+</html>
