@@ -2,10 +2,10 @@
   const button = document.getElementById('copy-apps');
   const status = document.getElementById('setup-status');
   let source = '';
-  fetch('../update-line/apps-script.txt?v=agency-layout-20261113', { cache: 'no-store' })
+  fetch('../update-line/apps-script.txt?v=workbook-all-20261113', { cache: 'no-store' })
     .then(response => { if (!response.ok) throw Error(); return response.text(); })
     .then(text => {
-      if (!text.includes("build: 'agency-layout-20261113'") || !text.includes('tripImportDiningTables_')) throw Error();
+      if (!text.includes("build: 'workbook-all-20261113'") || !text.includes('tripWorkbookConfirmSaved_')) throw Error();
       source = text; button.disabled = false; button.textContent = '複製完整 Apps Script 程式';
     })
     .catch(() => { button.textContent = '載入失敗，請重新整理'; });

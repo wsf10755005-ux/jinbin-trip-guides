@@ -5,17 +5,17 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex,nofollow">
   <meta name="referrer" content="no-referrer">
-  <title>旅行社 Excel 讀取修正｜金賓員工旅遊</title>
+  <title>整份 Excel 一次匯入｜金賓員工旅遊</title>
   <link rel="stylesheet" href="admin.css?v=20261105">
-  <script src="fix-agency.js?v=agency-layout-20261113" defer></script>
+  <script src="fix-agency.js?v=workbook-all-20261113" defer></script>
 </head>
 <body>
-  <header class="topbar"><div><span class="brand">金賓員工旅遊</span><h1>旅行社 Excel 讀取修正</h1></div></header>
+  <header class="topbar"><div><span class="brand">金賓員工旅遊</span><h1>整份 Excel 一次匯入</h1></div></header>
   <main>
     <p class="notice">這次只需更新 Apps Script。Cloudflare 已完成車次功能的部署。</p>
     <section class="reminder-card">
       <h2>1. 複製完整程式</h2>
-      <p>支援不同午餐區各自從第 1 桌編號；同一分頁左側放車次、右側放桌次，也可一起辨識。備註與接駁車名單會略過。</p>
+      <p>整本 Excel 上傳一次，系統依報名表的方案與梯次，整理福森號第1梯次、第2梯次和台中南投。名單、桌次與車次一起預覽，按一次確認即可匯入。</p>
       <button class="primary full" id="copy-apps" disabled>正在準備程式…</button>
       <p id="setup-status" role="status" class="field-hint"></p>
     </section>
@@ -29,13 +29,13 @@
       </ol>
       <p class="field-hint">API_SECRET 等指令碼屬性沿用現有設定。</p>
       <a class="text-button" href="https://script.google.com/macros/s/AKfycbyNHd8T0-5ZQSRxApv1vlTLkaa5_PqLo_7JlzEXhnJ4qaQfxDo_Zf1ncBcuqAp_dq-h/exec" target="_blank" rel="noopener noreferrer">開啟部署版本檢查 ↗</a>
-      <p class="field-hint">看到 build 為 agency-layout-20261113，代表這次修正已上線。</p>
+      <p class="field-hint">看到 build 為 workbook-all-20261113，代表一次匯入功能已上線。</p>
     </section>
     <section class="reminder-card">
       <h2>3. 在 LINE 重傳原本 Excel</h2>
-      <p>先核對名單，再核對所選行程的桌次，最後核對車次。每一步都先預覽，按「確認匯入」後才會寫入。</p>
-      <p>桌次仍按行程分別確認：福森號第1梯次、第2梯次、台中南投。若要更新三個行程，請重傳同一本，分別選擇行程，不用拆檔。</p>
-      <p class="field-hint">已存在的名單會比對更新。取消後面的步驟，前面已確認的資料仍會保留。上傳 .xlsx 才能保留姓名綠字或綠底的素食標記。</p>
+      <p>核對總覽中的新增／更新人數，以及三個行程各自的桌次、車次人數，再按一次「確認匯入」。不必選行程，也不用重傳三次。</p>
+      <p>有同名、未知姓名、未分梯次或重複安排時，會先列出問題，本次資料暫不寫入。請修正後重傳。</p>
+      <p class="field-hint">已存在的名單會比對更新。按取消時，本次資料都不會寫入。上傳 .xlsx 會保留綠字／綠底素食標記，也支援姓名後的「純素」「方便素」註記。</p>
     </section>
   </main>
 </body>
