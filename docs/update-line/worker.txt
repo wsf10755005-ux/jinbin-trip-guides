@@ -551,12 +551,19 @@ async function buildReply(message, lineUserId, env, deadline) {
       const messages = [result.reply, ...notices.filter(notice => notice !== result.reply)];
       return messages.length === 1 ? messages[0] : messages;
     }
-    return topic ? result.reply : BIND_SUCCESS;
+    return topic ? result.reply : bindingSuccessMessage(result);
   }
   if (['unbound', 'disabled', 'pending', 'bind_rejected'].includes(result.status) && topic) return NAME_REQUIRED;
   if (result.status === 'route_assignment_missing' && topic) return FUSEN_ASSIGNMENT_PENDING;
+  if (result.status === 'meeting_point_unavailable') return '集合地點資料尚未確認，請聯絡旅遊承辦人。';
   if (result.status === 'busy') return '系統忙碌中，請稍後重新輸入。';
   return TRIP_UNAVAILABLE;
+}
+
+function bindingSuccessMessage(result) {
+  if (result.meetingPointCode === undefined || result.meetingPointCode === 'TINGHU') return BIND_SUCCESS;
+  if (result.meetingPointCode !== 'REN_AI_PARK') throw new EmployeeApiError('APPS_MEETING_POINT_INVALID');
+  return '綁定成功！\n\n本次您的集合地點在「圳前仁愛公園」\nhttps://maps.app.goo.gl/gcE4gj3ieCw8eLFo7\n\n請點選下方選單查詢行程、車次、桌次、房號或旅遊攻略。';
 }
 
 function r02MorningMessage(result) {
@@ -671,7 +678,7 @@ async function handleAdminRequest(request, env) {
   if (request.method === 'OPTIONS') return adminResponse(null, 204);
   const path = new URL(request.url).pathname;
   if (path === '/admin/health' && request.method === 'GET') {
-    return adminResponse({ service: 'employee-trip', build: 'workbook-vehicle-20261113',
+    return adminResponse({ service: 'employee-trip', build: 'pickup-20261113',
       adminConfigured: typeof env.ADMIN_PASSWORD === 'string' && env.ADMIN_PASSWORD.trim().length >= 12 });
   }
   if (!['/admin/login', '/admin/reminders'].includes(path)) return adminResponse({ error: '找不到此功能。' }, 404);

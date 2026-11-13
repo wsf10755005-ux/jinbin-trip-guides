@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><meta name="referrer" content="no-referrer">
+<title>個別集合地點更新｜金賓員工旅遊</title>
+<link rel="stylesheet" href="admin.css?v=20261105">
+<script src="pickup.js?v=pickup-20261113" defer></script>
+</head>
+<body>
+<header class="topbar"><div><span class="brand">金賓員工旅遊</span><h1>個別集合地點更新</h1></div></header>
+<main>
+<p class="notice">指定台中上車人員，綁定成功只顯示「圳前仁愛公園」；其他人維持「金賓汽車頂湖廠」。個人設定存於私人資料庫，不放在網站程式內。</p>
+<section class="reminder-card">
+<h2>1. 更新 Apps Script</h2>
+<button class="primary full" id="copy-apps" disabled>正在載入…</button>
+<a class="text-button" href="https://script.google.com/home/projects/1qenRhxJ6T2KAYu7RRbbrTSbJy2A8m78xTJFRMTqGVBomhTSyYdqd8OyM/edit" target="_blank" rel="noopener noreferrer">開啟 Apps Script ↗</a>
+<p>Code.gs 全選，貼完整程式並儲存。再到「部署 → 管理部署作業 → 編輯」，選「新版本」部署，沿用原本的網址。</p>
+</section>
+<section class="reminder-card">
+<h2>2. 更新 Cloudflare Worker</h2>
+<button class="primary full" id="copy-worker" disabled>正在載入…</button>
+<a class="text-button" href="https://dash.cloudflare.com/" target="_blank" rel="noopener noreferrer">開啟 Cloudflare ↗</a>
+<p>employee-trip-line-bot → 編輯程式碼，原程式全選，貼上完整程式，再按部署。</p>
+</section>
+<p id="setup-status" role="status" class="field-hint"></p>
+<p>兩端版本都是 pickup-20261113 才代表已生效。設定只影響綁定成功訊息，不會主動群發通知。</p>
+<p>整本 Excel 一次匯入功能已包含；這次更新不需要重新匯入名單。</p>
+</main>
+</body>
+</html>

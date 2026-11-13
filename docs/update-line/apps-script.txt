@@ -10,7 +10,7 @@ const TRIP_FUSEN_ROUTES = ['R01-AC', 'R01-BD'];
 const TRIP_FUSEN_PENDING = '福森號梯次尚未設定，請聯絡旅遊承辦人。';
 
 function doGet() {
-  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'workbook-all-20261113' });
+  return tripJson_({ success: true, status: 'ok', service: 'employee-trip', build: 'pickup-20261113' });
 }
 
 function doPost(e) {
@@ -178,7 +178,13 @@ function tripPortal_(ss, body) {
     if (!valid(body.name)) return tripStatus_('name_not_found');
     const result = tripBind_(ss, body.lineUserId, body.name.trim());
     if (result.status !== 'approved') return result;
-    return { success: true, status: 'approved', reply: '綁定成功！請點選下方選單查詢行程、桌次、房號或旅遊攻略。' };
+    const meetingPointCode = tripBindingMeetingPoint_(ss, body.name.trim());
+    if (!meetingPointCode) return tripStatus_('meeting_point_unavailable');
+    const meeting = meetingPointCode === 'REN_AI_PARK'
+      ? '本次您的集合地點在「圳前仁愛公園」\nhttps://maps.app.goo.gl/gcE4gj3ieCw8eLFo7'
+      : '本次兩方案集合地點都在「金賓汽車頂湖廠」\nhttps://share.google/D0maFrCaCc2iNcHVA';
+    return { success: true, status: 'approved', meetingPointCode: meetingPointCode,
+      reply: '綁定成功！\n\n' + meeting + '\n\n請點選下方選單查詢行程、車次、桌次、房號或旅遊攻略。' };
   }
   const access = tripLookup_(ss, body.lineUserId, true);
   if (access.status !== 'approved') return access;
@@ -225,6 +231,23 @@ function tripPortal_(ss, body) {
     if (tripFusenPending_(routeIds)) reply = tripFusenPending_(routeIds) + (rows.length ? '\n\n' + reply : '');
   }
   return { success: true, status: 'approved', reply: reply.slice(0, 4500) };
+}
+
+function tripBindingMeetingPoint_(ss, name) {
+  const employees = tripEmployees_(ss).rows;
+  const matches = employees.filter(function (row) { return tripText_(row[1]) === name; });
+  if (matches.length !== 1 || tripText_(matches[0][4]) !== '啟用') return null;
+  const key = tripParticipantKey_(matches[0]);
+  if (!key || employees.filter(function (row) { return tripParticipantKey_(row) === key; }).length !== 1) return null;
+  const sheet = ss.getSheetByName('集合地點設定');
+  if (!sheet) return 'TINGHU';
+  const rows = sheet.getDataRange().getDisplayValues();
+  if (tripText_((rows[0] || [])[0]) !== '人員識別碼' || tripText_((rows[0] || [])[1]) !== '集合地點代碼') return null;
+  const configured = rows.slice(1).filter(function (row) { return tripText_(row[0]) === key; });
+  if (!configured.length) return 'TINGHU';
+  if (configured.length !== 1) return null;
+  const code = tripText_(configured[0][1]);
+  return ['TINGHU', 'REN_AI_PARK'].includes(code) ? code : null;
 }
 
 function tripLookup_(ss, lineUserId, includeDetails) {
